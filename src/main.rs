@@ -1,5 +1,6 @@
 //mod detached_command;
 //use detached_command::*;
+mod tcp_csv_msg_connection;
 
 use wlambda::VVal;
 
@@ -273,6 +274,21 @@ fn route() {
 }
 
 fn main() {
+    let mut c = tcp_csv_msg_connection::TCPCSVConnection::new();
+
+    c.connect();
+    loop {
+        match c.reader_rx.as_mut().unwrap().recv() {
+            Ok(it) => {
+                println!("RECV: {:?}", it);
+            },
+            Err(e) => {
+                println!("ERROR: {}", e);
+            }
+        }
+    }
+
+
     route();
 //    let mut dc = DetachedCommand::start("wlambda", &[]).expect("X");
 //
