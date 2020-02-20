@@ -18,7 +18,7 @@ There are different kinds of processes:
 struct Label(usize);
 
 #[derive(Debug, Clone)]
-struct ForgettingInternalizer {
+struct LabelInternalizer {
     labels:           std::collections::HashMap<String, (usize, u128, bool)>,
     resolve:          std::collections::HashMap<usize, String>,
     free_ids:         std::vec::Vec<usize>,
@@ -26,7 +26,7 @@ struct ForgettingInternalizer {
     max_label_age_ms: u128,
 }
 
-impl ForgettingInternalizer {
+impl LabelInternalizer {
     pub fn new() -> Self {
         Self {
             labels:           std::collections::HashMap::new(),
@@ -121,26 +121,32 @@ enum AdapterError {
 trait Adapter {
     fn try_poll_one(&mut self) -> Result<Message, AdapterError>;
     fn send(&mut self, msg: &Message);
+    fn main_label(&self) -> Option<Label>;
 }
 
 #[derive(Debug, Clone)]
 struct ConsoleAdapter {
-    lbl: std::rc::Rc<std::cell::RefCell<ForgettingInternalizer>>,
+    lbl: std::rc::Rc<std::cell::RefCell<LabelInternalizer>>,
     name: String,
     cnt: usize,
 }
 
 impl Adapter for ConsoleAdapter {
+    fn main_label(&self) -> Option<Label> {
+        Some(self.lbl.borrow_mut().perm_lbl(&self.name))
+    }
+
     fn try_poll_one(&mut self) -> Result<Message, AdapterError> {
         if self.cnt > 0 {
             self.cnt -= 1;
             let v = VVal::vec();
             v.push(VVal::new_str("OK"));
             v.push(VVal::Int((self.cnt + 1) as i64));
+            let src = self.main_label().unwrap();
             let mut fl = self.lbl.borrow_mut();
             return Ok(Message {
-                src:     fl.tmp_lbl(&self.name),
-                dest:    fl.tmp_lbl("@Out"),
+                src,
+                dest:    fl.tmp_lbl("A"),
                 payload: v,
             });
         } else {
@@ -157,31 +163,67 @@ impl Adapter for ConsoleAdapter {
     }
 }
 
-fn route() {
-    let mut ads : std::vec::Vec<Box<dyn Adapter>> = vec![];
+struct Router {
+    labels:      std::rc::Rc<std::cell::RefCell<LabelInternalizer>>,
+    adapters:    std::vec::Vec<Box<dyn Adapter>>,
+    routes:      std::vec::Vec<usize>, // maps labels to adapter index
+    send_queue:  std::vec::Vec<Message>,
+}
 
-    let lbl =
-        std::rc::Rc::new(
-            std::cell::RefCell::new(
-                ForgettingInternalizer::new()));
+impl Router {
+    pub fn new() -> Self {
+        Self {
+            labels:
+                std::rc::Rc::new(
+                    std::cell::RefCell::new(
+                        LabelInternalizer::new())),
+            adapters:   vec![],
+            routes:     vec![],
+            send_queue: vec![],
+        }
+    }
 
-    ads.push(Box::new(ConsoleAdapter { name: "A".to_string(), cnt: 2, lbl: lbl.clone() }));
-    ads.push(Box::new(ConsoleAdapter { name: "B".to_string(), cnt: 3, lbl: lbl.clone() }));
+    pub fn add_adapter(&mut self, adapter: Box<dyn Adapter>) {
+        let ad_idx = self.adapters.len();
 
-    let mut snd_queue : std::vec::Vec<Message> = vec![];
-    loop {
-        let mut i = 0;
-        while !snd_queue.is_empty() {
-            let len = ads.len();
-            ads[i % len].send(&snd_queue.pop().unwrap());
-            i += 1;
+        if let Some(ad_lbl) = adapter.main_label() {
+            if ad_lbl.0 >= self.routes.len() {
+                self.routes.resize(ad_lbl.0 * 2, 0);
+            }
+            self.routes[ad_lbl.0] = ad_idx + 1;
         }
 
-        for a in ads.iter_mut() {
+        self.adapters.push(adapter);
+    }
+
+    pub fn get_adapter(&mut self, idx: usize) -> Option<&mut Box<dyn Adapter>> {
+        if idx == 0 { return None; }
+        if idx >= self.adapters.len() { return None; }
+        Some(&mut self.adapters[idx - 1])
+    }
+
+    pub fn get_adapter_for_label(&mut self, lbl: Label) -> Option<&mut Box<dyn Adapter>> {
+        if lbl.0 >= self.routes.len() {
+            return None;
+        }
+        self.get_adapter(self.routes[lbl.0])
+    }
+
+    pub fn one_process_cycle(&mut self) {
+        while !self.send_queue.is_empty() {
+            let msg = self.send_queue.pop().unwrap();
+            if let Some(ad) = self.get_adapter_for_label(msg.dest) {
+                ad.send(&msg);
+            } else {
+                println!("Dropped Message: {:?}", msg);
+            }
+        }
+
+        for a in self.adapters.iter_mut() {
 //            if let Some(ref mut adap) = a {
                 match a.try_poll_one() {
                     Ok(msg) => {
-                        snd_queue.push(msg);
+                        self.send_queue.push(msg);
                     },
                     Err(e) => {
                         match e {
@@ -194,6 +236,39 @@ fn route() {
                 }
 //            }
         }
+    }
+}
+
+fn route() {
+//    let mut ads : std::vec::Vec<Box<dyn Adapter>> = vec![];
+//
+//    let lbl =
+//        std::rc::Rc::new(
+//            std::cell::RefCell::new(
+//                LabelInternalizer::new()));
+//
+//    ads.push(Box::new(ConsoleAdapter { name: "A".to_string(), cnt: 2, lbl: lbl.clone() }));
+//    ads.push(Box::new(ConsoleAdapter { name: "B".to_string(), cnt: 3, lbl: lbl.clone() }));
+//
+//    loop {
+//    }
+
+    let mut router = Router::new();
+
+    router.add_adapter(Box::new(ConsoleAdapter {
+        name: "A".to_string(),
+        cnt: 2,
+        lbl: router.labels.clone(),
+    }));
+
+    router.add_adapter(Box::new(ConsoleAdapter {
+        name: "B".to_string(),
+        cnt: 2,
+        lbl: router.labels.clone(),
+    }));
+
+    loop {
+        router.one_process_cycle();
     }
 }
 
