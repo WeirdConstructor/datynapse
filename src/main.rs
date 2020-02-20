@@ -146,8 +146,8 @@ impl Adapter for ConsoleAdapter {
         } else {
             return Err(AdapterError::End);
         }
-
     }
+
     fn send(&mut self, msg: &Message) {
         println!("TO[{}/{}] FROM[{}]: {}",
             self.lbl.borrow().resolve(msg.dest),
