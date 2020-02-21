@@ -274,18 +274,28 @@ fn route() {
 }
 
 fn main() {
-    let mut c = tcp_csv_msg_connection::TCPCSVConnection::new();
+    {
+        let mut c = tcp_csv_msg_connection::TCPCSVConnection::new();
 
-    c.connect();
-    loop {
-        match c.reader_rx.as_mut().unwrap().recv() {
-            Ok(it) => {
-                println!("RECV: {:?}", it);
-            },
-            Err(e) => {
-                println!("ERROR: {}", e);
+        c.connect();
+        loop {
+            match c.reader_rx.as_mut().unwrap().recv() {
+                Ok(tcp_csv_msg_connection::Event::IncomingMessage(msg)) => {
+                    if msg == "quit\n" {
+                        break;
+                    }
+                    println!("RECV: {}", msg);
+                },
+                Ok(it) => {
+                    println!("RECV: {:?}", it);
+                },
+                Err(e) => {
+                    println!("ERROR: {}", e);
+                }
             }
         }
+
+        c.shutdown();
     }
 
 
