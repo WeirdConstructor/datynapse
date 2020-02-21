@@ -6,6 +6,8 @@ use std::net::TcpStream;
 #[derive(Debug, Clone)]
 pub enum Event {
     IncomingMessage(String),
+    DroppedMessage,
+    FlushedMessage,
     ConnectError(String),
     Connected(String),
     Quit,
@@ -56,8 +58,16 @@ impl TCPCSVConnection {
         let stop_reader = self.stop.clone();
         let reader = std::thread::spawn(move || {
             loop {
+                // clear write buffer
+                if let Ok(wrx) = wr_rx.lock() {
+                    for _data in wrx.try_iter() {
+                        if let Err(e) = event_tx.send(
+                            Event::DroppedMessage) {
+                        }
+                    }
+                }
+
                 use std::str::FromStr;
-                println!("CONNECTING:..");
                 let mut stream =
                     TcpStream::connect_timeout(
                         &std::net::SocketAddr::from_str(&ep)
@@ -93,20 +103,43 @@ impl TCPCSVConnection {
                                 Ok(wr_rx) => {
                                     while let Ok(Some(bytes)) = wr_rx.recv() {
                                         if let Err(e) = writer_stream.write_all(&bytes) {
-                                            if let Err(e) = writer_event_tx.send(
-                                                Event::ConnectError(
-                                                    format!("Write error from {}: {}",
-                                                            wr_ep, e))) {
-                                            };
-                                            break;
+                                            match e.kind() {
+                                                std::io::ErrorKind::TimedOut
+                                                | std::io::ErrorKind::WouldBlock => {
+                                                    if let Err(e) = writer_event_tx.send(
+                                                        Event::DroppedMessage) {
+                                                    }
+                                                    continue;
+                                                },
+                                                _ => {
+                                                    if let Err(e) = writer_event_tx.send(
+                                                        Event::DroppedMessage) {
+                                                    }
+
+                                                    if let Err(e) = writer_event_tx.send(
+                                                        Event::ConnectError(
+                                                            format!("Write error from {}: {}",
+                                                                    wr_ep, e))) {
+                                                    }
+                                                    break;
+                                                }
+                                            }
                                         }
+
                                         if let Err(e) = writer_stream.flush() {
+                                            if let Err(e) = writer_event_tx.send(
+                                                Event::DroppedMessage) {
+                                            }
+
                                             if let Err(_) = writer_event_tx.send(
                                                 Event::ConnectError(
                                                     format!("Write flush error from {}: {}",
                                                             wr_ep, e))) {
                                             };
                                             break;
+                                        }
+                                        if let Err(e) = writer_event_tx.send(
+                                            Event::FlushedMessage) {
                                         }
                                     }
                                 },
@@ -118,7 +151,8 @@ impl TCPCSVConnection {
                                     };
                                 },
                             }
-                            eprintln!("writer ends");
+
+                            //d// eprintln!("writer ends");
                         });
 
                         if let Err(e) =
@@ -189,7 +223,7 @@ impl TCPCSVConnection {
                     },
                 }
 
-                eprintln!("reader ends (2)");
+                //d// eprintln!("reader ends (2)");
             }
         });
 
