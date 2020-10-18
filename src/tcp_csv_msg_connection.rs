@@ -4,24 +4,29 @@ use std::sync::atomic::AtomicBool;
 use std::net::TcpStream;
 use std::net::TcpListener;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
-    Data(String, Vec<Vec<u8>>),
-    Hello(Vec<Vec<u8>>),
+    Direct(Vec<String>),
+    Payload(&'static str, Vec<u8>),
+    Hello(Vec<String>),
+    Error(Vec<String>),
     Ping,
     Quit,
     Ok(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReadMsgError {
-    InvalidCommand,
+    TryAgain,
+    NeedMoreData,
+    ProtocolError,
     Timeout,
     EOF,
     ReadError(String, String),
 }
 
 fn next_arg(s: &str) -> (String, &str) {
-    let s = s.strip_prefix(|c: char| c.is_whitespace()).unwrap_or(s);
+    let s = s.trim_start();
 
     if let Some(s) = s.strip_prefix('"') {
         let mut arg = String::new();
@@ -35,6 +40,8 @@ fn next_arg(s: &str) -> (String, &str) {
                     return (arg, &s[(byte_pos + 1)..]);
                 } else if c == '\\' {
                     escaped = true;
+                } else {
+                    arg.push(c);
                 }
             }
         }
@@ -53,9 +60,30 @@ fn next_arg(s: &str) -> (String, &str) {
     }
 }
 
-impl Msg {
+pub struct MessageReader {
+    payload_name: Option<&'static str>,
+    payload_buf:  Option<Vec<u8>>,
+    payload_len:  Option<u64>,
+}
 
-    pub fn read_msg<R: std::io::BufRead>(ep: &str, buf: &mut R) -> Result<Msg, ReadMsgError> {
+impl MessageReader {
+    pub fn new() -> Self {
+        Self {
+            payload_name: None,
+            payload_buf:  None,
+            payload_len:  None,
+        }
+    }
+
+    fn read_payload(&mut self, ep: &str, buf: &mut dyn std::io::BufRead) -> Result<Msg, ReadMsgError> {
+        Err(ReadMsgError::ProtocolError)
+    }
+
+    pub fn read_msg(&mut self, ep: &str, buf: &mut dyn std::io::BufRead) -> Result<Msg, ReadMsgError> {
+        if self.payload_len.is_some() {
+            return self.read_payload(ep, buf);
+        }
+
         use std::io::BufRead;
         let mut line = String::new();
         match buf.read_line(&mut line) {
@@ -67,10 +95,51 @@ impl Msg {
                 let v: Vec<&str> =
                     line.splitn(2, |c: char| c.is_whitespace()).collect();
 
-                let command = v[0];
+                let command  = v[0];
+                let mut rest = if v.len() > 1 { v[1] } else { "" };
+
                 match command {
+                    "direct" => {
+                        let mut args = vec![];
+                        while rest.len() > 0 {
+                            let (arg, r) = next_arg(rest);
+                            rest = r;
+                            args.push(arg);
+                        }
+
+                        return Ok(Msg::Direct(args));
+                    },
+                    "error" => {
+                        let mut args = vec![];
+                        while rest.len() > 0 {
+                            let (arg, r) = next_arg(rest);
+                            rest = r;
+                            args.push(arg);
+                        }
+
+                        return Ok(Msg::Error(args));
+                    },
+                    "msgpack" => {
+                        let (len_arg, _) = next_arg(rest);
+                        if let Ok(len) = u64::from_str_radix(&len_arg, 10) {
+                            self.payload_len  = Some(len);
+                            self.payload_buf  = Some(vec![]);
+                            self.payload_name = Some("msgpack");
+                            return self.read_payload(ep, buf);
+                        } else {
+                            return Err(ReadMsgError::ProtocolError);
+                        }
+                    },
                     "json" => {
-                        return Ok(Msg::Data(String::new(), vec![]));
+                        let (len_arg, _) = next_arg(rest);
+                        if let Ok(len) = u64::from_str_radix(&len_arg, 10) {
+                            self.payload_len  = Some(len);
+                            self.payload_buf  = Some(vec![]);
+                            self.payload_name = Some("json");
+                            return self.read_payload(ep, buf);
+                        } else {
+                            return Err(ReadMsgError::ProtocolError);
+                        }
                     },
                     "hello" => {
                         return Ok(Msg::Hello(vec![]));
@@ -82,10 +151,14 @@ impl Msg {
                         return Ok(Msg::Ping);
                     },
                     "ok" => {
-                        return Ok(Msg::Ok(v[0].to_string()));
+                        let (arg, _) = next_arg(rest);
+                        return Ok(Msg::Ok(arg));
+                    },
+                    "" => {
+                        return Err(ReadMsgError::TryAgain);
                     },
                     _ => {
-                        return Err(ReadMsgError::InvalidCommand);
+                        return Err(ReadMsgError::ProtocolError);
                     },
                 }
             },
@@ -418,5 +491,107 @@ impl TCPCSVConnection {
             if let Err(_) = rd.join() {
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_arg_parsing() {
+        let (arg, rest) = next_arg("foo bar exop");
+        assert_eq!(arg, "foo");
+        assert_eq!(rest, "bar exop");
+
+        let (arg, rest) = next_arg("foo");
+        assert_eq!(arg, "foo");
+        assert_eq!(rest, "");
+
+        let (arg, rest) = next_arg("");
+        assert_eq!(arg, "");
+        assert_eq!(rest, "");
+
+        let (arg, rest) = next_arg("\"foo\" bar exop");
+        assert_eq!(arg, "foo");
+        assert_eq!(rest, " bar exop");
+
+        let (arg, rest) = next_arg("\"fo\\\"o\" \"bar oo\" exop");
+        assert_eq!(arg, "fo\"o");
+        assert_eq!(rest, " \"bar oo\" exop");
+
+        let (arg, rest) = next_arg(rest);
+        assert_eq!(arg, "bar oo");
+        assert_eq!(rest, " exop");
+
+        let (arg, rest) = next_arg(rest);
+        assert_eq!(arg, "exop");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn check_read_msg() {
+        let mut mr = MessageReader::new();
+        let mut b = "ok".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("".to_string()));
+
+        let mut mr = MessageReader::new();
+        let mut b = "ok foo".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("foo".to_string()));
+
+        let mut mr = MessageReader::new();
+        let mut b = "ok foo\r\nok bar\r\nquit".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("foo".to_string()));
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("bar".to_string()));
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Quit);
+
+        let mut mr = MessageReader::new();
+        let mut b = "ok foo\nok bar\nquit\n".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("foo".to_string()));
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("bar".to_string()));
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Quit);
+
+        let mut mr = MessageReader::new();
+        let mut b = "\r\n\r\nok foo".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap_err();
+        assert_eq!(ret, ReadMsgError::TryAgain);
+        let ret = mr.read_msg("epz", &mut b).unwrap_err();
+        assert_eq!(ret, ReadMsgError::TryAgain);
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Ok("foo".to_string()));
+
+        let mut mr = MessageReader::new();
+        let mut b = "direct \"foo bar\" bar xx \t  foo".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Direct(vec![
+            "foo bar".to_string(),
+            "bar".to_string(),
+            "xx".to_string(),
+            "foo".to_string(),
+        ]));
+
+        let mut mr = MessageReader::new();
+        let mut b = "error \"foo bar\" bar xx \t  foo".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Error(vec![
+            "foo bar".to_string(),
+            "bar".to_string(),
+            "xx".to_string(),
+            "foo".to_string(),
+        ]));
+
+        let mut mr = MessageReader::new();
+        let mut b = "json 4\n[\"\"]\n".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Payload("json", "[\"\"]".to_string().as_bytes().to_vec()));
     }
 }
