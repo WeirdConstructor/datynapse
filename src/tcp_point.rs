@@ -1,9 +1,68 @@
 #[derive(Debug, PartialEq, Copy, Clone)]
-struct TCPId {
+struct Id {
     SrvClient(usize, usize),
     Connection(usize),
 }
 
+enum Error {
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum Message {
+    Connected,
+    Disconnted,
+    Data,
+    SendQueueEmpty,
+}
+
+type TCPRes = Result<Message, Error>;
+
+struct TCPPoint {
+    // server vector with vector of connections
+    // direct connection vector with connection info (for reconnect)
+    // internal message queue
+    // global atom for stopping everything?!
+}
+
+impl TCPPoint {
+    fn listen_on(port: u16) -> Id {
+        // Make server socket
+        // Listen on port
+        // Start accepter thread
+        // For new sockets, create a connection and store it in the global vector
+        Id::SrvClient(0, 0)
+    }
+
+    fn connect_to(host: String, port: u16, timeout: std::time::Duration) -> Id {
+        Id::Connection(0)
+    }
+
+    fn next() -> Option<(Id, TCPRes)> {
+        None
+    }
+}
+
+struct SyncHandle {
+}
+
+impl SyncHandle {
+    fn send(data: &[u8]) -> TCPRes {
+        Err(Error::Unknown)
+    }
+
+    fn read_some() -> TCPRes {
+        Err(Error::Unknown)
+    }
+
+    fn wait_connect() -> TCPRes {
+        Err(Error::Unknown)
+    }
+
+    fn wait_disconnect() -> TCPRes {
+        Err(Error::Unknown)
+    }
+}
 
 /*
 let tcppoint = TCPPoint::new();
