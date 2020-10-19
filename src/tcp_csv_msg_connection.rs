@@ -3,6 +3,7 @@ use std::sync::*;
 use std::sync::atomic::AtomicBool;
 use std::net::TcpStream;
 use std::net::TcpListener;
+use std::fmt::Write;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
@@ -13,6 +14,75 @@ pub enum Msg {
     Ping,
     Quit,
     Ok(String),
+}
+
+fn write_msg_arg(w: &mut std::fmt::Write, arg: &str) {
+    if let Some(_) = arg.find(|c: char| c.is_whitespace() || c == '"') {
+        write!(w, "\"").expect("write to work");
+        for c in arg.chars() {
+            match c {
+                '"'  => write!(w, "\\\"").expect("write to work"),
+                '\\' => write!(w, "\\\\").expect("write to work"),
+                '\r' => write!(w, "\\r").expect("write to work"),
+                '\n' => write!(w, "\\n").expect("write to work"),
+                c    => w.write_char(c).expect("write to work"),
+            }
+        }
+        write!(w, "\"").expect("write to work");
+    } else {
+        write!(w, "{}", arg);
+    }
+}
+
+fn write_msg_args(w: &mut std::fmt::Write, args: &[String]) {
+    for a in args {
+        write!(w, " ").expect("write to work");
+        write_msg_arg(w, a);
+    }
+}
+
+impl Msg {
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut s = String::new();
+        let mut payload : Option<&[u8]> = None;
+        match self {
+            Msg::Ping           => write!(&mut s, "ping").expect("write to work"),
+            Msg::Quit           => write!(&mut s, "quit").expect("write to work"),
+            Msg::Ok(arg)        => write!(&mut s, "ok {}", arg).expect("write to work"),
+            Msg::Hello(args)    => {
+                write!(&mut s, "hello").expect("write to work");
+                write_msg_args(&mut s, args);
+            },
+            Msg::Error(args)    => {
+                write!(&mut s, "error").expect("write to work");
+                write_msg_args(&mut s, args);
+            },
+            Msg::Direct(args) => {
+                write!(&mut s, "direct").expect("write to work");
+                write_msg_args(&mut s, args);
+            },
+            Msg::Payload(name, args, msg_payload) => {
+                write!(&mut s, "{}", name).expect("write to work");
+                write!(&mut s, " {}", msg_payload.len()).expect("write to work");
+                if let Some(args) = args {
+                    write_msg_args(&mut s, args);
+                }
+                write!(&mut s, "\r\n").expect("write to work");
+                payload = Some(&msg_payload[..]);
+            },
+        }
+
+        write!(&mut s, "\r\n").expect("write to work");
+
+        let mut b = s.into_bytes();
+        if let Some(payload) = payload {
+            b.extend_from_slice(payload);
+            b.push(b'\r');
+            b.push(b'\n');
+        }
+
+        b
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,7 +103,11 @@ fn next_arg(s: &str) -> (String, &str) {
         let mut escaped = false;
         for (byte_pos, c) in s.char_indices() {
             if escaped {
-                arg.push(c);
+                match c {
+                    'r' => arg.push('\r'),
+                    'n' => arg.push('\n'),
+                    _   => arg.push(c),
+                }
                 escaped = false;
             } else {
                 if c == '"' {
@@ -673,5 +747,38 @@ mod tests {
             "bar".to_string(),
             "it'sJSON".to_string(),
         ]), "[\"\"]\n".to_string().as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn check_msg_to_frame() {
+        assert_eq!(
+            Msg::Ok("foo".to_string()).to_frame(),
+            b"ok foo\r\n");
+        assert_eq!(Msg::Quit.to_frame(), b"quit\r\n");
+        assert_eq!(Msg::Ping.to_frame(), b"ping\r\n");
+        assert_eq!(
+            Msg::Hello(vec![
+                "foo".to_string(),
+                "bar xxx".to_string(),
+                "bar \r\n xxx".to_string(),
+                "\"".to_string(),
+            ]).to_frame(),
+            b"hello foo \"bar xxx\" \"bar \\r\\n xxx\" \"\\\"\"\r\n");
+        assert_eq!(
+            Msg::Direct(vec![
+                "foo".to_string(),
+                "bar xxx".to_string(),
+                "bar \r\n xxx".to_string(),
+                "\"".to_string(),
+            ]).to_frame(),
+            b"direct foo \"bar xxx\" \"bar \\r\\n xxx\" \"\\\"\"\r\n");
+        assert_eq!(
+            Msg::Error(vec![
+                "foo".to_string(),
+                "bar xxx".to_string(),
+                "bar \r\n xxx".to_string(),
+                "\"".to_string(),
+            ]).to_frame(),
+            b"error foo \"bar xxx\" \"bar \\r\\n xxx\" \"\\\"\"\r\n");
     }
 }
