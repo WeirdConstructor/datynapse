@@ -7,7 +7,7 @@ use std::net::TcpListener;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     Direct(Vec<String>),
-    Payload(&'static str, Vec<u8>),
+    Payload(&'static str, Option<Vec<String>>, Vec<u8>),
     Hello(Vec<String>),
     Error(Vec<String>),
     Ping,
@@ -61,26 +61,70 @@ fn next_arg(s: &str) -> (String, &str) {
 }
 
 pub struct MessageReader {
-    payload_name: Option<&'static str>,
-    payload_buf:  Option<Vec<u8>>,
-    payload_len:  Option<u64>,
+    payload_name:       Option<&'static str>,
+    payload_buf:        Option<Vec<u8>>,
+    payload_rem_len:    Option<u64>,
+    payload_data:       Option<Vec<String>>,
 }
 
 impl MessageReader {
     pub fn new() -> Self {
         Self {
-            payload_name: None,
-            payload_buf:  None,
-            payload_len:  None,
+            payload_name:       None,
+            payload_buf:        None,
+            payload_rem_len:    None,
+            payload_data:       None,
         }
     }
 
     fn read_payload(&mut self, ep: &str, buf: &mut dyn std::io::BufRead) -> Result<Msg, ReadMsgError> {
-        Err(ReadMsgError::ProtocolError)
+        let rlen = self.payload_rem_len.unwrap();
+
+        if rlen > 0 {
+            let take_len = if rlen < 4096 { rlen as usize } else { 4096 };
+            let mut data_buf : [u8; 4096] = [0; 4096];
+
+            match buf.read(&mut data_buf[0..take_len]) {
+                Ok(n) => {
+                    if n == 0 {
+                        return Err(ReadMsgError::EOF);
+                    }
+                    if n > take_len {
+                        return Err(ReadMsgError::ProtocolError);
+                    }
+                    println!("READPAL: [{:#?}]", &data_buf[0..take_len]);
+
+                    self.payload_rem_len = Some(rlen - (n as u64));
+                    self.payload_buf.as_mut().unwrap().extend_from_slice(&data_buf[0..n]);
+                },
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock => {
+                            return Err(ReadMsgError::Timeout);
+                        },
+                        _ => {
+                            return Err(ReadMsgError::ReadError(
+                                ep.to_string(), format!("{}", e)));
+                        }
+                    }
+                },
+            }
+        }
+
+        if self.payload_rem_len.unwrap() == 0 {
+            self.payload_rem_len = None;
+            return Ok(Msg::Payload(
+                self.payload_name.take().unwrap(),
+                self.payload_data.take(),
+                self.payload_buf.take().unwrap()));
+        } else {
+            return Err(ReadMsgError::TryAgain);
+        }
     }
 
     pub fn read_msg(&mut self, ep: &str, buf: &mut dyn std::io::BufRead) -> Result<Msg, ReadMsgError> {
-        if self.payload_len.is_some() {
+        if self.payload_rem_len.is_some() {
             return self.read_payload(ep, buf);
         }
 
@@ -91,6 +135,7 @@ impl MessageReader {
                 if n == 0 {
                     return Err(ReadMsgError::EOF);
                 }
+                println!("READL: [{}]", line);
 
                 let v: Vec<&str> =
                     line.splitn(2, |c: char| c.is_whitespace()).collect();
@@ -109,6 +154,27 @@ impl MessageReader {
 
                         return Ok(Msg::Direct(args));
                     },
+                    "payload" => {
+                        let (len_arg, r) = next_arg(rest);
+                        rest = r;
+
+                        let mut args = vec![];
+                        while rest.len() > 0 {
+                            let (arg, r) = next_arg(rest);
+                            rest = r;
+                            args.push(arg);
+                        }
+
+                        if let Ok(len) = u64::from_str_radix(&len_arg, 10) {
+                            self.payload_rem_len  = Some(len);
+                            self.payload_buf      = Some(vec![]);
+                            self.payload_name     = Some("payload");
+                            self.payload_data     = Some(args);
+                            return self.read_payload(ep, buf);
+                        } else {
+                            return Err(ReadMsgError::ProtocolError);
+                        }
+                    },
                     "error" => {
                         let mut args = vec![];
                         while rest.len() > 0 {
@@ -122,9 +188,9 @@ impl MessageReader {
                     "msgpack" => {
                         let (len_arg, _) = next_arg(rest);
                         if let Ok(len) = u64::from_str_radix(&len_arg, 10) {
-                            self.payload_len  = Some(len);
-                            self.payload_buf  = Some(vec![]);
-                            self.payload_name = Some("msgpack");
+                            self.payload_rem_len  = Some(len);
+                            self.payload_buf      = Some(vec![]);
+                            self.payload_name     = Some("msgpack");
                             return self.read_payload(ep, buf);
                         } else {
                             return Err(ReadMsgError::ProtocolError);
@@ -133,9 +199,9 @@ impl MessageReader {
                     "json" => {
                         let (len_arg, _) = next_arg(rest);
                         if let Ok(len) = u64::from_str_radix(&len_arg, 10) {
-                            self.payload_len  = Some(len);
-                            self.payload_buf  = Some(vec![]);
-                            self.payload_name = Some("json");
+                            self.payload_rem_len  = Some(len);
+                            self.payload_buf      = Some(vec![]);
+                            self.payload_name     = Some("json");
                             return self.read_payload(ep, buf);
                         } else {
                             return Err(ReadMsgError::ProtocolError);
@@ -590,8 +656,22 @@ mod tests {
         ]));
 
         let mut mr = MessageReader::new();
-        let mut b = "json 4\n[\"\"]\n".as_bytes();
+        let mut b = "json 5\n[\"\"]\njson 0\njson 6\n".as_bytes();
         let ret = mr.read_msg("epz", &mut b).unwrap();
-        assert_eq!(ret, Msg::Payload("json", "[\"\"]".to_string().as_bytes().to_vec()));
+        assert_eq!(ret, Msg::Payload("json", None, "[\"\"]\n".to_string().as_bytes().to_vec()));
+
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Payload("json", None, "".to_string().as_bytes().to_vec()));
+        let ret = mr.read_msg("epz", &mut b);
+        assert_eq!(ret, Err(ReadMsgError::EOF));
+
+        let mut mr = MessageReader::new();
+        let mut b = "payload 5 foo bar it'sJSON\n[\"\"]\n".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Payload("payload", Some(vec![
+            "foo".to_string(),
+            "bar".to_string(),
+            "it'sJSON".to_string(),
+        ]), "[\"\"]\n".to_string().as_bytes().to_vec()));
     }
 }
