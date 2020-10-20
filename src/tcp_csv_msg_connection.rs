@@ -407,29 +407,57 @@ fn set_stream_settings(stream: &mut TcpStream, op_timeout_ms: u64) {
 }
 
 
+/// A persistent TCP connection
+///
+/// - Connection communicates events via mpsc
+/// - Connection can be controlled via Connection-Handle
+/// - A connect thread cares about reconnecting the connection once lost.
+/// - The Read/Write threads care about reading and writing data
+/// - Everything can be shut down using the stop-Boolean
+///   - Thread handles are kept around for easy cleanup
+
 pub struct TCPCSVConnection {
+    /// Controls the maximum amount a thread blocks in an I/O operation
+    /// in the background. This is for making sure, the connection can be
+    /// shut down in the given time.
     op_timeout_ms:      u64,
     reader:             Option<std::thread::JoinHandle<()>>,
-    writer_tx:          Option<mpsc::Sender<Option<Vec<u8>>>>,
-    pub reader_rx:      Option<mpsc::Receiver<Event>>,
+    writer:             Option<std::thread::JoinHandle<()>>,
+    connector:          Option<std::thread::JoinHandle<()>>,
+    writer_tx:          mpsc::Sender<Option<Vec<u8>>>,
+    writer_rx:          Option<mpsc::Receiver<Option<Vec<u8>>>>,
+    event_tx:           mpsc::Sender<Event>,
+    pub event_rx:       mpsc::Receiver<Event>,
+    next_writer_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
+    next_reader_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
     stop:               std::sync::Arc<AtomicBool>,
 }
 
 impl TCPCSVConnection {
     pub fn new() -> Self {
+        let (w_tx, w_rx) = std::sync::mpsc::channel();
+        let (e_tx, e_rx) = std::sync::mpsc::channel();
+
         Self {
-            op_timeout_ms: 10000,
-            reader:        None,
-            writer_tx:     None,
-            reader_rx:     None,
-            stop:          std::sync::Arc::new(AtomicBool::new(false)),
+            op_timeout_ms:      10000,
+            reader:             None,
+            writer:             None,
+            connector:          None,
+            writer_tx:          w_tx,
+            writer_rx:          Some(w_rx),
+            event_tx:           e_tx,
+            event_rx:           e_rx,
+            // Writer thread needs to clear the writer_rx queue upon receiving
+            // the new stream and needs to send the "connected" event through the
+            // event_tx
+            next_writer_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            next_reader_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stop:               std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn send(&mut self, s: &str) -> Result<(), std::sync::mpsc::SendError<Option<Vec<u8>>>> {
-        if let Some(ref mut wtx) = self.writer_tx.as_mut() {
-            wtx.send(Some(s.to_string().into_bytes()))?;
-        }
+        self.writer_tx.send(wtx.send(Some(s.to_string().into_bytes())))?;
         Ok(())
     }
 
