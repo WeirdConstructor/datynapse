@@ -30,7 +30,7 @@ fn write_msg_arg(w: &mut std::fmt::Write, arg: &str) {
         }
         write!(w, "\"").expect("write to work");
     } else {
-        write!(w, "{}", arg);
+        write!(w, "{}", arg).expect("write to work");
     }
 }
 
@@ -321,10 +321,13 @@ impl MessageReader {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    IncomingMessage(Msg),
-    FlushedMessage,
+    RecvMessage(Msg),
+    SentMessage,
+    SendQueueEmpty,
     ConnectError(String),
-    Connected(String),
+    Connected,
+    LogErr(String),
+    LogInf(String),
     Quit,
 }
 
@@ -424,13 +427,40 @@ pub struct TCPCSVConnection {
     reader:             Option<std::thread::JoinHandle<()>>,
     writer:             Option<std::thread::JoinHandle<()>>,
     connector:          Option<std::thread::JoinHandle<()>>,
-    writer_tx:          mpsc::Sender<Option<Vec<u8>>>,
-    writer_rx:          Option<mpsc::Receiver<Option<Vec<u8>>>>,
+    writer_tx:          mpsc::Sender<Option<Msg>>,
+    writer_rx:          Option<mpsc::Receiver<Option<Msg>>>,
     event_tx:           mpsc::Sender<Event>,
     pub event_rx:       mpsc::Receiver<Event>,
     next_writer_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
     next_reader_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
     stop:               std::sync::Arc<AtomicBool>,
+}
+
+macro_rules! send_event {
+    ($where: expr, $event_tx: expr, $event: expr) => {
+        if let Err(e) = $event_tx.send($event) {
+            let _ =
+                $event_tx.send(
+                    Event::LogErr(
+                        format!("error sending event from {}: {}", $where, e)));
+            break;
+        }
+    }
+}
+
+
+macro_rules! lock_mutex {
+    ($where: expr, $event_tx: expr, $mutex: expr, $ok_var: ident, $do: block) => {
+        match $mutex.lock() {
+            Ok(mut $ok_var) => $do,
+            Err(e) => {
+                send_event!($where, $event_tx,
+                    Event::LogErr(
+                        format!("error getting lock: {}", e)));
+                break;
+            },
+        }
+    }
 }
 
 impl TCPCSVConnection {
@@ -456,9 +486,45 @@ impl TCPCSVConnection {
         }
     }
 
-    pub fn send(&mut self, s: &str) -> Result<(), std::sync::mpsc::SendError<Option<Vec<u8>>>> {
-        self.writer_tx.send(wtx.send(Some(s.to_string().into_bytes())))?;
+    pub fn send(&mut self, msg: Msg) -> Result<(), std::sync::mpsc::SendError<Option<Msg>>> {
+        self.writer_tx.send(Some(msg))?;
         Ok(())
+    }
+
+    fn start_writer(&mut self) -> std::thread::JoinHandle<()> {
+        let writer =
+            self.writer_rx.take()
+                .expect("start_writer to be called only once!");
+        let stop               = self.stop.clone();
+        let next_writer_stream = self.next_writer_stream.clone();
+        let event_tx           = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            let mut stream = None;
+            while stop.load(std::sync::atomic::Ordering::Relaxed) {
+                lock_mutex!("writer", event_tx, next_writer_stream, stream_opt, {
+                    if let Some(new_stream) = (*stream_opt).take() {
+                        stream = Some(new_stream);
+
+                        // TODO: clear write queue
+
+                        send_event!("writer", event_tx, Event::Connected);
+
+                    } else if stream.is_none() {
+                        // Sleep a bit, as long as we haven't got a stream at all:
+                        // FIXME: Use a condition variable!
+                        std::thread::sleep(
+                            std::time::Duration::from_millis(250));
+                    }
+                });
+
+                // if got stream:
+                //   - look for messages to be written
+                //   - write them, send a "written" event
+                //   - once something has been written and the write buffer is empty,
+                //     send a "write_queue_empty" event
+            }
+        })
     }
 
 //    fn spawn_writer_thread(mut writer_stream: TcpStream,
@@ -608,57 +674,57 @@ impl TCPCSVConnection {
     }
 
     pub fn connect(&mut self) {
-        let op_timeout_ms = self.op_timeout_ms;
-
-        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
-
-        let ep = String::from("127.0.0.1:57322");
-        let reader = std::thread::spawn(move || {
-            loop {
-                use std::str::FromStr;
-                let mut stream =
-                    TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from_str(&ep)
-                         .expect("Valid endpoint address"),
-                        std::time::Duration::from_millis(op_timeout_ms));
-
-                match stream {
-                    Ok(mut stream) => {
-                        set_stream_settings(&mut stream, op_timeout_ms);
-//                        self.init_read_write(stream);
-                    },
-                    Err(err) => {
-//                        if let Err(e) =
-////                            event_tx.send(
-////                                Event::ConnectError(
-////                                    format!("Couldn't connect to {}: {:?}", ep, err))) {
-//                            break;
-//                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                        continue;
-                    },
-                }
-
-                //d// eprintln!("reader ends (2)");
-            }
-        });
-
-        std::mem::replace(&mut self.reader, Some(reader));
+//        let op_timeout_ms = self.op_timeout_ms;
+//
+//        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
+//
+//        let ep = String::from("127.0.0.1:57322");
+//        let reader = std::thread::spawn(move || {
+//            loop {
+//                use std::str::FromStr;
+//                let mut stream =
+//                    TcpStream::connect_timeout(
+//                        &std::net::SocketAddr::from_str(&ep)
+//                         .expect("Valid endpoint address"),
+//                        std::time::Duration::from_millis(op_timeout_ms));
+//
+//                match stream {
+//                    Ok(mut stream) => {
+//                        set_stream_settings(&mut stream, op_timeout_ms);
+////                        self.init_read_write(stream);
+//                    },
+//                    Err(err) => {
+////                        if let Err(e) =
+//////                            event_tx.send(
+//////                                Event::ConnectError(
+//////                                    format!("Couldn't connect to {}: {:?}", ep, err))) {
+////                            break;
+////                        }
+//                        std::thread::sleep(std::time::Duration::from_millis(1000));
+//                        continue;
+//                    },
+//                }
+//
+//                //d// eprintln!("reader ends (2)");
+//            }
+//        });
+//
+//        std::mem::replace(&mut self.reader, Some(reader));
     }
 
     pub fn shutdown(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(wtx) = &self.writer_tx {
-            if let Err(_) = wtx.send(None) {
-            }
-        }
-        std::mem::replace(&mut self.reader_rx, None);
-        std::mem::replace(&mut self.writer_tx, None);
-        let rd = std::mem::replace(&mut self.reader, None);
-        if let Some(rd) = rd {
-            if let Err(_) = rd.join() {
-            }
-        }
+//        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+//        if let Some(wtx) = &self.writer_tx {
+//            if let Err(_) = wtx.send(None) {
+//            }
+//        }
+//        std::mem::replace(&mut self.reader_rx, None);
+//        std::mem::replace(&mut self.writer_tx, None);
+//        let rd = std::mem::replace(&mut self.reader, None);
+//        if let Some(rd) = rd {
+//            if let Err(_) = rd.join() {
+//            }
+//        }
     }
 }
 
