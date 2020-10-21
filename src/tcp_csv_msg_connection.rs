@@ -431,6 +431,7 @@ pub struct TCPCSVConnection {
     next_writer_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
     next_reader_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
     stop:               std::sync::Arc<AtomicBool>,
+    need_reconnect:     std::sync::Arc<AtomicBool>,
 }
 
 macro_rules! send_event {
@@ -480,6 +481,7 @@ impl TCPCSVConnection {
             next_writer_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
             next_reader_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stop:               std::sync::Arc::new(AtomicBool::new(false)),
+            need_reconnect:     std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -490,6 +492,7 @@ impl TCPCSVConnection {
 
     fn start_reader(&mut self) -> std::thread::JoinHandle<()> {
         let stop               = self.stop.clone();
+        let need_reconnect     = self.need_reconnect.clone();
         let next_reader_stream = self.next_reader_stream.clone();
         let event_tx           = self.event_tx.clone();
 
@@ -548,6 +551,7 @@ impl TCPCSVConnection {
             self.writer_rx.take()
                 .expect("start_writer to be called only once!");
         let stop               = self.stop.clone();
+        let need_reconnect     = self.need_reconnect.clone();
         let next_writer_stream = self.next_writer_stream.clone();
         let event_tx           = self.event_tx.clone();
 
@@ -794,43 +798,61 @@ impl TCPCSVConnection {
 //        writer.join();
     }
 
-    pub fn connect(&mut self) {
-//        let op_timeout_ms = self.op_timeout_ms;
-//
-//        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
-//
-//        let ep = String::from("127.0.0.1:57322");
-//        let reader = std::thread::spawn(move || {
-//            loop {
-//                use std::str::FromStr;
-//                let mut stream =
-//                    TcpStream::connect_timeout(
-//                        &std::net::SocketAddr::from_str(&ep)
-//                         .expect("Valid endpoint address"),
-//                        std::time::Duration::from_millis(op_timeout_ms));
-//
-//                match stream {
-//                    Ok(mut stream) => {
-//                        set_stream_settings(&mut stream, op_timeout_ms);
-////                        self.init_read_write(stream);
-//                    },
-//                    Err(err) => {
-////                        if let Err(e) =
-//////                            event_tx.send(
-//////                                Event::ConnectError(
-//////                                    format!("Couldn't connect to {}: {:?}", ep, err))) {
-////                            break;
-////                        }
-//                        std::thread::sleep(std::time::Duration::from_millis(1000));
-//                        continue;
-//                    },
-//                }
-//
-//                //d// eprintln!("reader ends (2)");
-//            }
-//        });
-//
-//        std::mem::replace(&mut self.reader, Some(reader));
+    pub fn start_connect(&mut self, ep: String) -> std::thread::JoinHandle<()> {
+        let stop           = self.stop.clone();
+        let need_reconnect = self.need_reconnect.clone();
+        let event_tx       = self.event_tx.clone();
+        let op_timeout_ms  = self.op_timeout_ms;
+
+        let next_writer_stream = self.next_writer_stream.clone();
+        let next_reader_stream = self.next_reader_stream.clone();
+
+        std::thread::spawn(move || {
+            loop {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                      && !need_reconnect.load(std::sync::atomic::Ordering::Relaxed) {
+                    // FIXME: Use a condition variable!!!111
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                use std::str::FromStr;
+                let mut stream =
+                    TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from_str(&ep)
+                         .expect("Valid endpoint address"),
+                        std::time::Duration::from_millis(op_timeout_ms));
+
+                match stream {
+                    Ok(mut stream) => {
+                        set_stream_settings(&mut stream, op_timeout_ms);
+                        need_reconnect.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                        lock_mutex!("connector", event_tx, next_writer_stream, stream_opt, {
+                            *stream_opt =
+                                Some(stream.try_clone().expect("cloing a TcpStream to work"));
+                        });
+                        lock_mutex!("connector", event_tx, next_reader_stream, stream_opt, {
+                            *stream_opt = Some(stream);
+                        });
+
+                    },
+                    Err(e) => {
+                        send_event!("connector", event_tx,
+                            Event::ConnectError(format!("{}", e)));
+
+                        // TODO: Make exponential time back off up to 1? minute
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        continue;
+                    },
+                }
+
+                //d// eprintln!("reader ends (2)");
+            }
+        })
     }
 
     pub fn shutdown(&mut self) {
