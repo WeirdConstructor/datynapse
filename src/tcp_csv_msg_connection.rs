@@ -461,6 +461,36 @@ macro_rules! lock_mutex {
     }
 }
 
+/*
+
+   let con = new();
+
+   con.connect("127.0.0.1:12932");
+
+   while let ev = con.wait() {
+        match ev {
+            Event::ConnectionAvailable => {
+               con.send(Msg::Hello("foo", "1.2.3"));
+            },
+            Event::RecvMessage(msg) => {
+                match msg {
+                    Msg::Hello(name, vers) => {
+                        con.send(Msg::Ok("hello".to_string()));
+                    },
+                    Msg::Ok("hello") => {
+                        logged_in = true;
+                    },
+                    _ => {
+                    },
+                }
+            },
+        }
+   }
+
+
+
+*/
+
 impl TCPCSVConnection {
     pub fn new() -> Self {
         let (w_tx, w_rx) = std::sync::mpsc::channel();
