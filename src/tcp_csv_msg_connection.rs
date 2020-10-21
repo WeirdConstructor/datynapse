@@ -88,7 +88,6 @@ impl Msg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadMsgError {
     TryAgain,
-    NeedMoreData,
     ProtocolError,
     Timeout,
     EOF,
@@ -166,7 +165,6 @@ impl MessageReader {
                     if n > take_len {
                         return Err(ReadMsgError::ProtocolError);
                     }
-                    println!("READPAL: [{:#?}]", &data_buf[0..take_len]);
 
                     self.payload_rem_len = Some(rlen - (n as u64));
                     self.payload_buf.as_mut().unwrap().extend_from_slice(&data_buf[0..n]);
@@ -323,9 +321,8 @@ impl MessageReader {
 pub enum Event {
     RecvMessage(Msg),
     SentMessage,
-    SendQueueEmpty,
+    ConnectionAvailable,
     ConnectError(String),
-    Connected,
     LogErr(String),
     LogInf(String),
     Quit,
@@ -491,24 +488,21 @@ impl TCPCSVConnection {
         Ok(())
     }
 
-    fn start_writer(&mut self) -> std::thread::JoinHandle<()> {
-        let writer =
-            self.writer_rx.take()
-                .expect("start_writer to be called only once!");
+    fn start_reader(&mut self) -> std::thread::JoinHandle<()> {
         let stop               = self.stop.clone();
-        let next_writer_stream = self.next_writer_stream.clone();
+        let next_reader_stream = self.next_reader_stream.clone();
         let event_tx           = self.event_tx.clone();
 
         std::thread::spawn(move || {
-            let mut stream = None;
+            let mut stream  = None;
+            let mut ep      = String::from("?:?");
+            let mut reader  = None;
+
             while stop.load(std::sync::atomic::Ordering::Relaxed) {
-                lock_mutex!("writer", event_tx, next_writer_stream, stream_opt, {
+                lock_mutex!("reader", event_tx, next_reader_stream, stream_opt, {
                     if let Some(new_stream) = (*stream_opt).take() {
-                        stream = Some(new_stream);
-
-                        // TODO: clear write queue
-
-                        send_event!("writer", event_tx, Event::Connected);
+                        stream = Some(std::io::BufReader::new(new_stream));
+                        reader = Some(MessageReader::new());
 
                     } else if stream.is_none() {
                         // Sleep a bit, as long as we haven't got a stream at all:
@@ -518,12 +512,139 @@ impl TCPCSVConnection {
                     }
                 });
 
+                if let Some(rd) = &mut reader {
+                    let mut try_again = true;
+                    while try_again {
+                        try_again = false;
+
+                        match rd.read_msg(&ep, stream.as_mut().unwrap()) {
+                            Ok(msg) => {
+                            },
+                            Err(ReadMsgError::Timeout) => {
+                                // nop
+                            },
+                            Err(ReadMsgError::TryAgain) => {
+                                try_again = true;
+                            },
+                            Err(e) => {
+                                send_event!("reader", event_tx,
+                                    Event::LogErr(
+                                        format!("read error: {:?}", e)));
+                            },
+                        }
+                    }
+                }
+
+
+            }
+
+            stream = None;
+            reader = None;
+        })
+    }
+
+    fn start_writer(&mut self) -> std::thread::JoinHandle<()> {
+        let writer =
+            self.writer_rx.take()
+                .expect("start_writer to be called only once!");
+        let stop               = self.stop.clone();
+        let next_writer_stream = self.next_writer_stream.clone();
+        let event_tx           = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            let mut stream                          = None;
+            let mut cur_frame     : Option<Vec<u8>> = None;
+            let mut cur_write_ptr : Option<&[u8]>   = None;
+
+            while stop.load(std::sync::atomic::Ordering::Relaxed) {
+                lock_mutex!("writer", event_tx, next_writer_stream, stream_opt, {
+                    if let Some(new_stream) = (*stream_opt).take() {
+                        stream = Some(new_stream);
+
+                        cur_frame     = None;
+                        cur_write_ptr = None;
+
+                        while let Ok(_) = writer.try_recv() {
+                            // nop
+                        }
+
+                        send_event!("writer", event_tx, Event::ConnectionAvailable);
+
+                    } else if stream.is_none() {
+                        // Sleep a bit, as long as we haven't got a stream at all:
+                        // FIXME: Use a condition variable!
+                        std::thread::sleep(
+                            std::time::Duration::from_millis(250));
+                    }
+                });
+
+                if cur_frame.is_none() {
+                    match writer.recv_timeout(std::time::Duration::from_millis(1000)) {
+                        Ok(None) => { break; },
+                        Ok(Some(msg)) => {
+                            cur_frame     = Some(msg.to_frame());
+                            cur_write_ptr = Some(&cur_frame.as_ref().unwrap()[..]);
+                        },
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            continue;
+                        },
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        },
+                    }
+
+                } else if let Some(strm) = stream.as_mut() {
+                    use std::io::Write;
+
+                    match strm.write(cur_write_ptr.unwrap()) {
+                        Ok(n) => {
+                            if n == 0 {
+                                cur_write_ptr = None;
+                                cur_frame     = None;
+                                stream        = None;
+                                continue;
+                            }
+
+                            cur_write_ptr =
+                                Some(&cur_write_ptr.take().unwrap()[n..]);
+
+                            if cur_write_ptr.as_ref().unwrap().len() == 0 {
+                                cur_write_ptr = None;
+                                cur_frame     = None;
+
+                                send_event!("writer", event_tx, Event::SentMessage);
+                            }
+                        },
+                        Err(e) => {
+                            match e.kind() {
+                                  std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock => { continue; },
+                                _ => {
+                                    cur_write_ptr = None;
+                                    cur_frame     = None;
+                                    stream        = None;
+
+                                    send_event!("writer", event_tx,
+                                        Event::LogErr(
+                                            format!("write error: {}", e)));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // if got stream:
                 //   - look for messages to be written
                 //   - write them, send a "written" event
                 //   - once something has been written and the write buffer is empty,
                 //     send a "write_queue_empty" event
             }
+
+            stream        = None;
+            cur_frame     = None;
+            cur_write_ptr = None;
         })
     }
 
