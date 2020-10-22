@@ -274,6 +274,14 @@ fn route() {
 }
 
 fn main() {
+    let mut con = tcp_csv_msg_connection::TCPCSVConnection::new();
+    con.connect("127.0.0.1:18444");
+
+    for ev in con.event_rx.iter() {
+        println!("EVENT: {:?}", ev);
+    }
+
+
     {
 //        let mut c = tcp_csv_msg_connection::TCPCSVConnection::new();
 //

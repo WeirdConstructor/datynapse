@@ -322,6 +322,7 @@ pub enum Event {
     RecvMessage(Msg),
     SentMessage,
     ConnectionAvailable,
+    ReaderConnectionAvailable,
     ConnectError(String),
     LogErr(String),
     LogInf(String),
@@ -380,10 +381,10 @@ impl TCPCSVServer {
                 stream.set_nodelay(true)
                     .expect("Setting TCP no delay");
                 stream.set_read_timeout(
-                    Some(std::time::Duration::from_millis(op_timeout_ms / 10)))
+                    Some(std::time::Duration::from_millis(op_timeout_ms)))
                     .expect("Setting read timeout");
                 stream.set_write_timeout(
-                    Some(std::time::Duration::from_millis(op_timeout_ms / 10)))
+                    Some(std::time::Duration::from_millis(op_timeout_ms)))
                     .expect("Setting write timeout");
                 stream.set_nonblocking(true)
                     .expect("Setting non-blocking");
@@ -399,10 +400,10 @@ fn set_stream_settings(stream: &mut TcpStream, op_timeout_ms: u64) {
     stream.set_nodelay(true)
         .expect("Setting TCP no delay");
     stream.set_read_timeout(
-        Some(std::time::Duration::from_millis(op_timeout_ms / 10)))
+        Some(std::time::Duration::from_millis(op_timeout_ms)))
         .expect("Setting read timeout");
     stream.set_write_timeout(
-        Some(std::time::Duration::from_millis(op_timeout_ms / 10)))
+        Some(std::time::Duration::from_millis(op_timeout_ms)))
         .expect("Setting write timeout");
 }
 
@@ -496,8 +497,8 @@ impl TCPCSVConnection {
         let (w_tx, w_rx) = std::sync::mpsc::channel();
         let (e_tx, e_rx) = std::sync::mpsc::channel();
 
-        Self {
-            op_timeout_ms:      10000,
+        let mut con = Self {
+            op_timeout_ms:      1000,
             reader:             None,
             writer:             None,
             connector:          None,
@@ -512,7 +513,12 @@ impl TCPCSVConnection {
             next_reader_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stop:               std::sync::Arc::new(AtomicBool::new(false)),
             need_reconnect:     std::sync::Arc::new(AtomicBool::new(false)),
-        }
+        };
+
+        con.reader    = Some(con.start_reader());
+        con.writer    = Some(con.start_writer());
+
+        con
     }
 
     pub fn send(&mut self, msg: Msg) -> Result<(), std::sync::mpsc::SendError<Option<Msg>>> {
@@ -531,12 +537,26 @@ impl TCPCSVConnection {
             let mut ep      = String::from("?:?");
             let mut reader  = None;
 
-            while stop.load(std::sync::atomic::Ordering::Relaxed) {
+            println!("READER START");
+
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if stream.is_none() {
+                    reader = None;
+                }
+
+                if let Some(s) = &stream {
+                    println!("R: {}", ep);
+                } else {
+//                    println!("R----");
+                }
+
                 lock_mutex!("reader", event_tx, next_reader_stream, stream_opt, {
                     if let Some(new_stream) = (*stream_opt).take() {
+                        ep = format!("{}", new_stream.local_addr().unwrap());
                         stream = Some(std::io::BufReader::new(new_stream));
                         reader = Some(MessageReader::new());
 
+                        send_event!("reader", event_tx, Event::ReaderConnectionAvailable);
                     } else if stream.is_none() {
                         // Sleep a bit, as long as we haven't got a stream at all:
                         // FIXME: Use a condition variable!
@@ -544,6 +564,7 @@ impl TCPCSVConnection {
                             std::time::Duration::from_millis(250));
                     }
                 });
+//                    println!("FOO 1");
 
                 if let Some(rd) = &mut reader {
                     let mut try_again = true;
@@ -552,22 +573,33 @@ impl TCPCSVConnection {
 
                         match rd.read_msg(&ep, stream.as_mut().unwrap()) {
                             Ok(msg) => {
+                                send_event!("reader", event_tx,
+                                    Event::RecvMessage(msg));
                             },
                             Err(ReadMsgError::Timeout) => {
+                                println!("TIMEOUT");
                                 // nop
                             },
                             Err(ReadMsgError::TryAgain) => {
+                                println!("TRYAGAIN");
                                 try_again = true;
                             },
                             Err(e) => {
                                 send_event!("reader", event_tx,
                                     Event::LogErr(
                                         format!("read error: {:?}", e)));
+
+                                stream.take().unwrap().into_inner()
+                                      .shutdown(std::net::Shutdown::Both);
+                                stream = None;
+                                need_reconnect.store(
+                                    true, std::sync::atomic::Ordering::Relaxed);
                             },
                         }
                     }
                 }
 
+//                println!("FOO 2");
 
             }
 
@@ -586,11 +618,15 @@ impl TCPCSVConnection {
         let event_tx           = self.event_tx.clone();
 
         std::thread::spawn(move || {
-            let mut stream                          = None;
+            let mut stream      : Option<TcpStream> = None;
             let mut cur_frame     : Option<Vec<u8>> = None;
             let mut cur_write_ptr : Option<&[u8]>   = None;
+            println!("WRITER START");
 
-            while stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(s) = &stream {
+                    println!("W: {}", s.local_addr().unwrap());
+                }
                 lock_mutex!("writer", event_tx, next_writer_stream, stream_opt, {
                     if let Some(new_stream) = (*stream_opt).take() {
                         stream = Some(new_stream);
@@ -657,11 +693,14 @@ impl TCPCSVConnection {
                                 _ => {
                                     cur_write_ptr = None;
                                     cur_frame     = None;
-                                    stream        = None;
+                                    stream.take().unwrap()
+                                          .shutdown(std::net::Shutdown::Both);
 
                                     send_event!("writer", event_tx,
                                         Event::LogErr(
                                             format!("write error: {}", e)));
+                                    need_reconnect.store(
+                                        true, std::sync::atomic::Ordering::Relaxed);
                                     continue;
                                 }
                             }
@@ -828,7 +867,17 @@ impl TCPCSVConnection {
 //        writer.join();
     }
 
-    pub fn start_connect(&mut self, ep: String) -> std::thread::JoinHandle<()> {
+    pub fn connect(&mut self, ep: &str) {
+        if self.connector.is_some() {
+            return;
+        }
+
+        self.connector = Some(self.start_connect(ep.to_string()));
+
+        self.need_reconnect.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn start_connect(&mut self, ep: String) -> std::thread::JoinHandle<()> {
         let stop           = self.stop.clone();
         let need_reconnect = self.need_reconnect.clone();
         let event_tx       = self.event_tx.clone();
@@ -862,10 +911,14 @@ impl TCPCSVConnection {
                         need_reconnect.store(false, std::sync::atomic::Ordering::Relaxed);
 
                         lock_mutex!("connector", event_tx, next_writer_stream, stream_opt, {
+                            println!("PROVIDED WRITER STREAM");
                             *stream_opt =
                                 Some(stream.try_clone().expect("cloing a TcpStream to work"));
+                            println!("PROVIDED WRITER STREAMDONE");
                         });
+                            println!("PROVIDED WRITER STREAMDONE 2");
                         lock_mutex!("connector", event_tx, next_reader_stream, stream_opt, {
+                            println!("PROVIDED READER STREAM");
                             *stream_opt = Some(stream);
                         });
 
