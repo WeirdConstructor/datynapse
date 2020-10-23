@@ -47,8 +47,7 @@ impl<T> SyncEvent<T> {
             return None;
         }
 
-        println!("RES:: {}", result.0.is_some());
-
+        self.0.available.store(false, Ordering::Relaxed);
         result.0.take()
     }
 }

@@ -667,6 +667,7 @@ impl TCPCSVConnection {
                 } else if let Some(strm) = stream.as_mut() {
                     use std::io::Write;
 
+println!("WRITE");
                     match strm.write(cur_write_ptr.unwrap()) {
                         Ok(n) => {
                             if n == 0 {
@@ -707,6 +708,7 @@ impl TCPCSVConnection {
                             }
                         }
                     }
+println!("WRITE END");
                 }
 
                 // if got stream:
