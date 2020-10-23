@@ -5,6 +5,8 @@ use std::net::TcpStream;
 use std::net::TcpListener;
 use std::fmt::Write;
 
+use crate::sync_event::SyncEvent;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     Direct(Vec<String>),
@@ -407,7 +409,6 @@ fn set_stream_settings(stream: &mut TcpStream, op_timeout_ms: u64) {
         .expect("Setting write timeout");
 }
 
-
 /// A persistent TCP connection
 ///
 /// - Connection communicates events via mpsc
@@ -429,8 +430,8 @@ pub struct TCPCSVConnection {
     writer_rx:          Option<mpsc::Receiver<Option<Msg>>>,
     event_tx:           mpsc::Sender<Event>,
     pub event_rx:       mpsc::Receiver<Event>,
-    next_writer_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
-    next_reader_stream: std::sync::Arc<std::sync::Mutex<Option<TcpStream>>>,
+    new_writer_stream:  SyncEvent<TcpStream>,
+    new_reader_stream:  SyncEvent<TcpStream>,
     stop:               std::sync::Arc<AtomicBool>,
     need_reconnect:     std::sync::Arc<AtomicBool>,
 }
@@ -509,8 +510,8 @@ impl TCPCSVConnection {
             // Writer thread needs to clear the writer_rx queue upon receiving
             // the new stream and needs to send the "connected" event through the
             // event_tx
-            next_writer_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            next_reader_stream: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            new_writer_stream:  SyncEvent::new(),
+            new_reader_stream:  SyncEvent::new(),
             stop:               std::sync::Arc::new(AtomicBool::new(false)),
             need_reconnect:     std::sync::Arc::new(AtomicBool::new(false)),
         };
@@ -527,10 +528,10 @@ impl TCPCSVConnection {
     }
 
     fn start_reader(&mut self) -> std::thread::JoinHandle<()> {
-        let stop               = self.stop.clone();
-        let need_reconnect     = self.need_reconnect.clone();
-        let next_reader_stream = self.next_reader_stream.clone();
-        let event_tx           = self.event_tx.clone();
+        let stop                  = self.stop.clone();
+        let need_reconnect        = self.need_reconnect.clone();
+        let new_reader_stream     = self.new_reader_stream.clone();
+        let event_tx              = self.event_tx.clone();
 
         std::thread::spawn(move || {
             let mut stream  = None;
@@ -550,21 +551,22 @@ impl TCPCSVConnection {
 //                    println!("R----");
                 }
 
-                lock_mutex!("reader", event_tx, next_reader_stream, stream_opt, {
-                    if let Some(new_stream) = (*stream_opt).take() {
-                        ep = format!("{}", new_stream.local_addr().unwrap());
+                if stream.is_none() || new_reader_stream.is_available() {
+                    let new_stream =
+                        new_reader_stream.recv_timeout(
+                            std::time::Duration::from_millis(250));
+
+                    if let Some(new_stream) = new_stream {
+                        ep =
+                            format!("{}",
+                                new_stream.local_addr().unwrap());
                         stream = Some(std::io::BufReader::new(new_stream));
                         reader = Some(MessageReader::new());
 
-                        send_event!("reader", event_tx, Event::ReaderConnectionAvailable);
-                    } else if stream.is_none() {
-                        // Sleep a bit, as long as we haven't got a stream at all:
-                        // FIXME: Use a condition variable!
-                        std::thread::sleep(
-                            std::time::Duration::from_millis(250));
+                    } else {
+                        continue;
                     }
-                });
-//                    println!("FOO 1");
+                }
 
                 if let Some(rd) = &mut reader {
                     let mut try_again = true;
@@ -612,25 +614,28 @@ impl TCPCSVConnection {
         let writer =
             self.writer_rx.take()
                 .expect("start_writer to be called only once!");
-        let stop               = self.stop.clone();
-        let need_reconnect     = self.need_reconnect.clone();
-        let next_writer_stream = self.next_writer_stream.clone();
-        let event_tx           = self.event_tx.clone();
+        let stop                   = self.stop.clone();
+        let need_reconnect         = self.need_reconnect.clone();
+        let new_writer_stream      = self.new_writer_stream.clone();
+        let event_tx               = self.event_tx.clone();
 
         std::thread::spawn(move || {
-            let mut stream      : Option<TcpStream> = None;
-            let mut cur_frame     : Option<Vec<u8>> = None;
-            let mut cur_write_ptr : Option<&[u8]>   = None;
+            let mut stream        : Option<TcpStream> = None;
+            let mut cur_frame     : Option<Vec<u8>>   = None;
+            let mut cur_write_ptr : Option<&[u8]>     = None;
             println!("WRITER START");
 
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(s) = &stream {
                     println!("W: {}", s.local_addr().unwrap());
                 }
-                lock_mutex!("writer", event_tx, next_writer_stream, stream_opt, {
-                    if let Some(new_stream) = (*stream_opt).take() {
-                        stream = Some(new_stream);
 
+                if stream.is_none() || new_writer_stream.is_available() {
+                    stream =
+                        new_writer_stream.recv_timeout(
+                            std::time::Duration::from_millis(250));
+
+                    if stream.is_some() {
                         cur_frame     = None;
                         cur_write_ptr = None;
 
@@ -639,14 +644,10 @@ impl TCPCSVConnection {
                         }
 
                         send_event!("writer", event_tx, Event::ConnectionAvailable);
-
-                    } else if stream.is_none() {
-                        // Sleep a bit, as long as we haven't got a stream at all:
-                        // FIXME: Use a condition variable!
-                        std::thread::sleep(
-                            std::time::Duration::from_millis(250));
+                    } else {
+                        continue;
                     }
-                });
+                }
 
                 if cur_frame.is_none() {
                     match writer.recv_timeout(std::time::Duration::from_millis(1000)) {
@@ -883,8 +884,8 @@ impl TCPCSVConnection {
         let event_tx       = self.event_tx.clone();
         let op_timeout_ms  = self.op_timeout_ms;
 
-        let next_writer_stream = self.next_writer_stream.clone();
-        let next_reader_stream = self.next_reader_stream.clone();
+        let new_writer_stream = self.new_writer_stream.clone();
+        let new_reader_stream = self.new_reader_stream.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -910,17 +911,10 @@ impl TCPCSVConnection {
                         set_stream_settings(&mut stream, op_timeout_ms);
                         need_reconnect.store(false, std::sync::atomic::Ordering::Relaxed);
 
-                        lock_mutex!("connector", event_tx, next_writer_stream, stream_opt, {
-                            println!("PROVIDED WRITER STREAM");
-                            *stream_opt =
-                                Some(stream.try_clone().expect("cloing a TcpStream to work"));
-                            println!("PROVIDED WRITER STREAMDONE");
-                        });
-                            println!("PROVIDED WRITER STREAMDONE 2");
-                        lock_mutex!("connector", event_tx, next_reader_stream, stream_opt, {
-                            println!("PROVIDED READER STREAM");
-                            *stream_opt = Some(stream);
-                        });
+                        new_writer_stream.send(
+                            stream.try_clone()
+                                  .expect("cloing a TcpStream to work"));
+                        new_reader_stream.send(stream);
 
                     },
                     Err(e) => {

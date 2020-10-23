@@ -1,6 +1,7 @@
 //mod detached_command;
 //use detached_command::*;
 mod tcp_csv_msg_connection;
+mod sync_event;
 
 use wlambda::VVal;
 
