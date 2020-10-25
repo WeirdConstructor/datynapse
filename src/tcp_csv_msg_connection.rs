@@ -359,6 +359,10 @@ impl EventCtx {
     pub fn new(user_id: u64, event: Event) -> Self {
         Self { user_id, event }
     }
+
+    pub fn new_queue() -> (mpsc::Sender<EventCtx>, mpsc::Receiver<EventCtx>) {
+        std::sync::mpsc::channel()
+    }
 }
 
 type ClientID = usize;
@@ -459,7 +463,6 @@ pub struct TCPCSVConnection {
     writer_tx:          mpsc::Sender<Option<Msg>>,
     writer_rx:          Option<mpsc::Receiver<Option<Msg>>>,
     event_tx:           mpsc::Sender<EventCtx>,
-    pub event_rx:       mpsc::Receiver<EventCtx>,
     new_writer_stream:  SyncEvent<TcpStream>,
     new_reader_stream:  SyncEvent<TcpStream>,
     stop:               std::sync::Arc<AtomicBool>,
@@ -481,9 +484,8 @@ macro_rules! send_event {
 }
 
 impl TCPCSVConnection {
-    pub fn new(user_id: u64) -> Self {
+    pub fn new(user_id: u64, e_tx: mpsc::Sender<EventCtx>) -> Self {
         let (w_tx, w_rx) = std::sync::mpsc::channel();
-        let (e_tx, e_rx) = std::sync::mpsc::channel();
 
         let mut con = Self {
             user_id,
@@ -494,7 +496,6 @@ impl TCPCSVConnection {
             writer_tx:          w_tx,
             writer_rx:          Some(w_rx),
             event_tx:           e_tx,
-            event_rx:           e_rx,
             // Writer thread needs to clear the writer_rx queue upon receiving
             // the new stream and needs to send the "connected" event through the
             // event_tx

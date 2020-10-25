@@ -275,9 +275,11 @@ fn route() {
 }
 
 fn main() {
-    use tcp_csv_msg_connection::{Event, Msg};
+    use tcp_csv_msg_connection::{Event, EventCtx, Msg};
 
-    let mut con = tcp_csv_msg_connection::TCPCSVConnection::new(12);
+    let (e_tx, e_rx) = EventCtx::new_queue();
+
+    let mut con = tcp_csv_msg_connection::TCPCSVConnection::new(12, e_tx);
     con.connect("127.0.0.1:18444");
 
     let my_name       = "test run";
@@ -291,8 +293,9 @@ fn main() {
     // TODO: measure time since last ping sent, if above => send ping
     // TODO: measure time since last "ok ping", if above => reconnect
 
+
     loop {
-        let evctx = con.event_rx.recv().expect("no error");
+        let evctx = e_rx.recv().expect("no error");
         let id = evctx.user_id;
         let ev = evctx.event;
 
