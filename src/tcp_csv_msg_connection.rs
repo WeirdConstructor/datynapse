@@ -349,6 +349,18 @@ pub enum Event {
     LogInf(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct EventCtx {
+    pub user_id:    u64,
+    pub event:      Event,
+}
+
+impl EventCtx {
+    pub fn new(user_id: u64, event: Event) -> Self {
+        Self { user_id, event }
+    }
+}
+
 type ClientID = usize;
 
 #[derive(Debug, Clone)]
@@ -446,77 +458,35 @@ pub struct TCPCSVConnection {
     connector:          Option<std::thread::JoinHandle<()>>,
     writer_tx:          mpsc::Sender<Option<Msg>>,
     writer_rx:          Option<mpsc::Receiver<Option<Msg>>>,
-    event_tx:           mpsc::Sender<Event>,
-    pub event_rx:       mpsc::Receiver<Event>,
+    event_tx:           mpsc::Sender<EventCtx>,
+    pub event_rx:       mpsc::Receiver<EventCtx>,
     new_writer_stream:  SyncEvent<TcpStream>,
     new_reader_stream:  SyncEvent<TcpStream>,
     stop:               std::sync::Arc<AtomicBool>,
     need_reconnect:     std::sync::Arc<AtomicBool>,
+    user_id:            u64,
 }
 
 macro_rules! send_event {
-    ($where: expr, $event_tx: expr, $event: expr) => {
-        if let Err(e) = $event_tx.send($event) {
+    ($where: expr, $user_id: expr, $event_tx: expr, $event: expr) => {
+        if let Err(e) = $event_tx.send(EventCtx::new($user_id, $event)) {
             let _ =
                 $event_tx.send(
-                    Event::LogErr(
-                        format!("error sending event from {}: {}", $where, e)));
+                    EventCtx::new($user_id,
+                        Event::LogErr(
+                            format!("error sending event from {}: {}", $where, e))));
             break;
         }
     }
 }
 
-
-macro_rules! lock_mutex {
-    ($where: expr, $event_tx: expr, $mutex: expr, $ok_var: ident, $do: block) => {
-        match $mutex.lock() {
-            Ok(mut $ok_var) => $do,
-            Err(e) => {
-                send_event!($where, $event_tx,
-                    Event::LogErr(
-                        format!("error getting lock: {}", e)));
-                break;
-            },
-        }
-    }
-}
-
-/*
-
-   let con = new();
-
-   con.connect("127.0.0.1:12932");
-
-   while let ev = con.wait() {
-        match ev {
-            Event::ConnectionAvailable => {
-               con.send(Msg::Hello("foo", "1.2.3"));
-            },
-            Event::RecvMessage(msg) => {
-                match msg {
-                    Msg::Hello(name, vers) => {
-                        con.send(Msg::Ok("hello".to_string()));
-                    },
-                    Msg::Ok("hello") => {
-                        logged_in = true;
-                    },
-                    _ => {
-                    },
-                }
-            },
-        }
-   }
-
-
-
-*/
-
 impl TCPCSVConnection {
-    pub fn new() -> Self {
+    pub fn new(user_id: u64) -> Self {
         let (w_tx, w_rx) = std::sync::mpsc::channel();
         let (e_tx, e_rx) = std::sync::mpsc::channel();
 
         let mut con = Self {
+            user_id,
             op_timeout_ms:      1000,
             reader:             None,
             writer:             None,
@@ -550,6 +520,7 @@ impl TCPCSVConnection {
         let need_reconnect        = self.need_reconnect.clone();
         let new_reader_stream     = self.new_reader_stream.clone();
         let event_tx              = self.event_tx.clone();
+        let user_id               = self.user_id;
 
         std::thread::spawn(move || {
             let mut stream  = None;
@@ -593,7 +564,7 @@ impl TCPCSVConnection {
 
                         match rd.read_msg(&ep, stream.as_mut().unwrap()) {
                             Ok(msg) => {
-                                send_event!("reader", event_tx,
+                                send_event!("reader", user_id, event_tx,
                                     Event::RecvMessage(msg));
                             },
                             Err(ReadMsgError::Timeout) => {
@@ -605,7 +576,7 @@ impl TCPCSVConnection {
                                 try_again = true;
                             },
                             Err(e) => {
-                                send_event!("reader", event_tx,
+                                send_event!("reader", user_id, event_tx,
                                     Event::LogErr(
                                         format!("read error: {:?}", e)));
 
@@ -618,9 +589,6 @@ impl TCPCSVConnection {
                         }
                     }
                 }
-
-//                println!("FOO 2");
-
             }
 
             stream = None;
@@ -636,6 +604,7 @@ impl TCPCSVConnection {
         let need_reconnect         = self.need_reconnect.clone();
         let new_writer_stream      = self.new_writer_stream.clone();
         let event_tx               = self.event_tx.clone();
+        let user_id                = self.user_id;
 
         std::thread::spawn(move || {
             let mut stream        : Option<TcpStream> = None;
@@ -661,7 +630,7 @@ impl TCPCSVConnection {
                             // nop
                         }
 
-                        send_event!("writer", event_tx, Event::ConnectionAvailable);
+                        send_event!("writer", user_id, event_tx, Event::ConnectionAvailable);
                     } else {
                         continue;
                     }
@@ -701,7 +670,7 @@ impl TCPCSVConnection {
                                 cur_write_ptr = None;
                                 cur_frame     = None;
 
-                                send_event!("writer", event_tx, Event::SentMessage);
+                                send_event!("writer", user_id, event_tx, Event::SentMessage);
                             }
                         },
                         Err(e) => {
@@ -715,7 +684,7 @@ impl TCPCSVConnection {
                                     stream.take().unwrap()
                                           .shutdown(std::net::Shutdown::Both);
 
-                                    send_event!("writer", event_tx,
+                                    send_event!("writer", user_id, event_tx,
                                         Event::LogErr(
                                             format!("write error: {}", e)));
                                     need_reconnect.store(
@@ -726,164 +695,12 @@ impl TCPCSVConnection {
                         }
                     }
                 }
-
-                // if got stream:
-                //   - look for messages to be written
-                //   - write them, send a "written" event
-                //   - once something has been written and the write buffer is empty,
-                //     send a "write_queue_empty" event
             }
 
             stream        = None;
             cur_frame     = None;
             cur_write_ptr = None;
         })
-    }
-
-//    fn spawn_writer_thread(mut writer_stream: TcpStream,
-//                           wr_ep: String,
-//                           writer_event_tx: mpsc::Sender<Event>,
-//                           writer_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Option<Vec<u8>>>>>)
-//        -> std::thread::JoinHandle<()>
-//    {
-//        std::thread::spawn(move || {
-//            use std::io::Write;
-//            match writer_rx.lock() {
-//                Ok(wr_rx) => {
-//                    while let Ok(Some(bytes)) = wr_rx.recv() {
-//                        if let Err(e) = writer_stream.write_all(&bytes) {
-//                            match e.kind() {
-//                                std::io::ErrorKind::TimedOut
-//                                | std::io::ErrorKind::WouldBlock => {
-//                                    let Err(_) = writer_event_tx.send(
-//                                        Event::ConnectError(
-//                                            format!("Write error (timeout) from {}: {}",
-//                                                    wr_ep, e))));
-//                                    break;
-//                                },
-//                                _ => {
-//                                    let Err(_) = writer_event_tx.send(
-//                                        Event::ConnectError(
-//                                            format!("Write error from {}: {}",
-//                                                    wr_ep, e))));
-//                                    break;
-//                                }
-//                            }
-//                        }
-//
-//                        if let Err(e) = writer_stream.flush() {
-//                            let Err(_) = writer_event_tx.send(
-//                                Event::ConnectError(
-//                                    format!("Write flush error from {}: {}",
-//                                            wr_ep, e)));
-//                            break;
-//                        }
-//
-//                        let Err(_) = writer_event_tx.send(Event::FlushedMessage);
-//                    }
-//                },
-//                Err(e) => {
-//                    if let Err(_) = writer_event_tx.send(
-//                        Event::ConnectError(
-//                            format!("Write queue mutex error from {}: {}",
-//                                    wr_ep, e))) {
-//                    };
-//                },
-//            }
-//            //d// eprintln!("writer ends");
-//        })
-//    }
-
-    pub fn init_read_write(&mut self, mut stream: TcpStream) {
-//        let (wr_tx, wr_rx)    = std::sync::mpsc::channel();
-//        let (event_tx, rd_rx) = std::sync::mpsc::channel();
-//
-//        let wr_stop_tx = wr_tx.clone();
-//
-//        self.writer_tx = Some(wr_tx);
-//        self.reader_rx = Some(rd_rx);
-//
-//        let wr_rx = std::sync::Arc::new(std::sync::Mutex::new(wr_rx));
-//
-//        let local_addr_str = match stream.local_addr() {
-//            Ok(s)  => format!("{}", s),
-//            Err(e) => format!("no-local-addr({})", e),
-//        };
-//
-////        // clear write buffer
-////        if let Ok(wrx) = wr_rx.lock() {
-////            for _data in wrx.try_iter() {
-////            }
-////        }
-//
-//        let mut writer_stream =
-//            stream
-//            .try_clone()
-//            .expect("Cloning stream should work for writer!");
-//
-//        let wr_ep           = ep.clone();
-//        let writer_event_tx = event_tx.clone();
-//        let writer_rx       = wr_rx.clone();
-//        let writer =
-//            spawn_writer_thread(
-//                writer_stream, wr_ep, writer_event_tx, writer_rx);
-//
-//        if let Err(e) =
-//            event_tx.send(
-//                Event::Connected(
-//                    format!("Connected to {} from {}",
-//                            ep, local_addr_str))) {
-//
-//            wr_stop_tx.send(None);
-//            writer.join();
-//            return;
-//        };
-//
-//        use std::io::BufRead;
-//        let mut buf = std::io::BufReader::new(stream);
-//        let stop_reader = self.stop.clone();
-//        loop {
-//            if stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
-//                break;
-//            }
-//
-//            let mut line = String::new();
-//            match buf.read_line(&mut line) {
-//                Ok(n) => {
-//                    if n == 0 {
-//                        if let Err(_) = event_tx.send(
-//                            Event::ConnectError(
-//                                format!("EOF from {}", ep))) {
-//                        };
-//                        break;
-//                    }
-//
-//                    if let Err(e) =
-//                        event_tx.send(Event::IncomingMessage(line)) {
-//                        break;
-//                    };
-//                },
-//                Err(e) => {
-//                    match e.kind() {
-//                        std::io::ErrorKind::TimedOut
-//                        | std::io::ErrorKind::WouldBlock => {
-//                            continue;
-//                        },
-//                        _ => {
-//                            if let Err(_) = event_tx.send(
-//                                Event::ConnectError(
-//                                    format!("Read error from {}: {}",
-//                                            ep, e))) {
-//                            };
-//                            break;
-//                        }
-//                    }
-//                },
-//            }
-//        }
-//
-//        wr_stop_tx.send(None);
-//        writer.join();
     }
 
     pub fn connect(&mut self, ep: &str) {
@@ -901,6 +718,7 @@ impl TCPCSVConnection {
         let need_reconnect = self.need_reconnect.clone();
         let event_tx       = self.event_tx.clone();
         let op_timeout_ms  = self.op_timeout_ms;
+        let user_id        = self.user_id;
 
         let new_writer_stream = self.new_writer_stream.clone();
         let new_reader_stream = self.new_reader_stream.clone();
@@ -935,7 +753,7 @@ impl TCPCSVConnection {
 
                     },
                     Err(e) => {
-                        send_event!("connector", event_tx,
+                        send_event!("connector", user_id, event_tx,
                             Event::ConnectError(format!("{}", e)));
 
                         // TODO: Make exponential time back off up to 1? minute
