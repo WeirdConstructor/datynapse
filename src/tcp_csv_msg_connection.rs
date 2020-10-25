@@ -112,7 +112,7 @@ fn next_arg(s: &str) -> (String, &str) {
                 escaped = false;
             } else {
                 if c == '"' {
-                    return (arg, &s[(byte_pos + 1)..]);
+                    return (arg, &s[(byte_pos + 1)..].trim_start());
                 } else if c == '\\' {
                     escaped = true;
                 } else {
@@ -130,7 +130,7 @@ fn next_arg(s: &str) -> (String, &str) {
         } else if v.len() == 1 {
             (v[0].to_string(), "")
         } else {
-            (v[0].to_string(), v[1])
+            (v[0].to_string(), v[1].trim_start())
         }
     }
 }
@@ -209,7 +209,7 @@ impl MessageReader {
                 if n == 0 {
                     return Err(ReadMsgError::EOF);
                 }
-                println!("READL: [{}]", line);
+                //d// println!("READL: [{}]", line);
 
                 let v: Vec<&str> =
                     line.splitn(2, |c: char| c.is_whitespace()).collect();
@@ -282,7 +282,14 @@ impl MessageReader {
                         }
                     },
                     "hello" => {
-                        return Ok(Msg::Hello(vec![]));
+                        let mut args = vec![];
+                        while rest.len() > 0 {
+                            let (arg, r) = next_arg(rest);
+                            rest = r;
+                            args.push(arg);
+                        }
+
+                        return Ok(Msg::Hello(args));
                     },
                     "quit" => {
                         return Ok(Msg::Quit);
@@ -971,15 +978,15 @@ mod tests {
 
         let (arg, rest) = next_arg("\"foo\" bar exop");
         assert_eq!(arg, "foo");
-        assert_eq!(rest, " bar exop");
+        assert_eq!(rest, "bar exop");
 
         let (arg, rest) = next_arg("\"fo\\\"o\" \"bar oo\" exop");
         assert_eq!(arg, "fo\"o");
-        assert_eq!(rest, " \"bar oo\" exop");
+        assert_eq!(rest, "\"bar oo\" exop");
 
         let (arg, rest) = next_arg(rest);
         assert_eq!(arg, "bar oo");
-        assert_eq!(rest, " exop");
+        assert_eq!(rest, "exop");
 
         let (arg, rest) = next_arg(rest);
         assert_eq!(arg, "exop");
@@ -1063,6 +1070,15 @@ mod tests {
             "bar".to_string(),
             "it'sJSON".to_string(),
         ]), "[\"\"]\n".to_string().as_bytes().to_vec()));
+
+        let mut mr = MessageReader::new();
+        let mut b = "hello foo ba \"foo\"\n".as_bytes();
+        let ret = mr.read_msg("epz", &mut b).unwrap();
+        assert_eq!(ret, Msg::Hello(vec![
+            "foo".to_string(),
+            "ba".to_string(),
+            "foo".to_string(),
+        ]));
     }
 
     #[test]
