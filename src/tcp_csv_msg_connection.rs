@@ -44,6 +44,18 @@ fn write_msg_args(w: &mut std::fmt::Write, args: &[String]) {
 }
 
 impl Msg {
+    pub fn ok_response(&self) -> Option<Self> {
+        match self {
+            Msg::Ping                => Some(Msg::Ok("ping".to_string())),
+            Msg::Quit                => Some(Msg::Ok("quit".to_string())),
+            Msg::Ok(arg)             => None,
+            Msg::Hello(args)         => Some(Msg::Ok("hello".to_string())),
+            Msg::Error(args)         => Some(Msg::Ok("error".to_string())),
+            Msg::Direct(args)        => Some(Msg::Ok("direct".to_string())),
+            Msg::Payload(name, _, _) => Some(Msg::Ok(name.to_string())),
+        }
+    }
+
     pub fn to_frame(&self) -> Vec<u8> {
         let mut s = String::new();
         let mut payload : Option<&[u8]> = None;
@@ -335,7 +347,6 @@ pub enum Event {
     ConnectError(String),
     LogErr(String),
     LogInf(String),
-    Quit,
 }
 
 type ClientID = usize;
@@ -586,11 +597,11 @@ impl TCPCSVConnection {
                                     Event::RecvMessage(msg));
                             },
                             Err(ReadMsgError::Timeout) => {
-                                println!("TIMEOUT");
+                                //d// println!("TIMEOUT");
                                 // nop
                             },
                             Err(ReadMsgError::TryAgain) => {
-                                println!("TRYAGAIN");
+                                //d// println!("TRYAGAIN");
                                 try_again = true;
                             },
                             Err(e) => {
@@ -674,7 +685,6 @@ impl TCPCSVConnection {
                 } else if let Some(strm) = stream.as_mut() {
                     use std::io::Write;
 
-println!("WRITE");
                     match strm.write(cur_write_ptr.unwrap()) {
                         Ok(n) => {
                             if n == 0 {
@@ -715,7 +725,6 @@ println!("WRITE");
                             }
                         }
                     }
-println!("WRITE END");
                 }
 
                 // if got stream:
@@ -900,7 +909,6 @@ println!("WRITE END");
             loop {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed)
                       && !need_reconnect.load(std::sync::atomic::Ordering::Relaxed) {
-                    // FIXME: Use a condition variable!!!111
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
 

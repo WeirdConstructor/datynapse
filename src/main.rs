@@ -275,11 +275,95 @@ fn route() {
 }
 
 fn main() {
+    use tcp_csv_msg_connection::{Event, Msg};
+
     let mut con = tcp_csv_msg_connection::TCPCSVConnection::new();
     con.connect("127.0.0.1:18444");
 
-    for ev in con.event_rx.iter() {
-        println!("EVENT: {:?}", ev);
+    let my_name       = "test run";
+    let my_version    = "0.1-alpha";
+    let proto_version = "1";
+
+    let mut logged_in  = false;
+    let mut hello_recv = false;
+    let mut hello_sent = false;
+
+    // TODO: measure time since last ping sent, if above => send ping
+    // TODO: measure time since last "ok ping", if above => reconnect
+
+    loop {
+        let ev = con.event_rx.recv().expect("no error");
+
+        //d// println!("EVENT: {:?}", ev);
+        match ev {
+            Event::ConnectionAvailable => {
+                logged_in = false;
+                con.send(Msg::Hello(vec![
+                    my_name.to_string(),
+                    my_version.to_string(),
+                    proto_version.to_string()
+                ]));
+            },
+            Event::RecvMessage(msg) => {
+                match &msg {
+                    Msg::Hello(args) => {
+                        println!("Handshake with: {:?}", args);
+                        hello_recv = true;
+                        if hello_recv && hello_sent {
+                            logged_in = true;
+                            println!("Logged in!");
+                        }
+                    },
+                    Msg::Ok(cmd) => {
+                        match &cmd[..] {
+                            "hello" => {
+                                hello_sent = true;
+                                if hello_recv && hello_sent {
+                                    logged_in = true;
+                                    println!("Logged in!");
+                                }
+                            },
+                            _ => (),
+                        }
+                    },
+                    Msg::Payload(p_cmd, args, payload) => {
+                        if logged_in {
+                            println!("RECV. PAYLOAD [{}]: {:?}", p_cmd, payload);
+                        }
+                    },
+                    Msg::Ping => {
+                        // NOP, handled by ok.
+                    },
+                    Msg::Quit => {
+                    },
+                    Msg::Direct(args) => {
+                        if logged_in {
+                            println!("DIRECT: {:?}", args);
+                        }
+                    },
+                    Msg::Error(_) => {
+                    },
+                }
+
+                if let Some(resp) = msg.ok_response() {
+                    con.send(resp);
+                }
+            },
+            Event::SentMessage => {
+            },
+            Event::ReaderConnectionAvailable => {
+                println!("reader there!");
+            },
+            Event::LogErr(err) => {
+                println!("** error: {}", err);
+            },
+            Event::LogInf(err) => {
+                println!("** info: {}", err);
+            },
+            Event::ConnectError(err) => {
+                println!("Connect error: {}", err);
+            },
+        }
     }
 
 
