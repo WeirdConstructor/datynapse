@@ -704,6 +704,32 @@ impl TCPCSVConnection {
         })
     }
 
+    fn start_server(&mut self, ep: &str) -> Result<(), std::io::Error> {
+        let l = TcpListener::bind(ep)?;
+
+        let stop          = self.stop.clone();
+        let op_timeout_ms = self.op_timeout_ms;
+        let event_tx      = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let mut stream =
+                    match stream {
+                        Ok(s) => s,
+                        Err(e) => {
+                            send_event!("listener", 0, event_tx,
+                                Event::ConnectError(format!("{}", e)));
+                            break;
+                        }
+                    };
+
+                set_stream_settings(&mut stream, op_timeout_ms);
+            }
+        });
+
+        Ok(())
+    }
+
     pub fn connect(&mut self, ep: &str) {
         if self.connector.is_some() {
             return;

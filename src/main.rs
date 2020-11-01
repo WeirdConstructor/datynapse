@@ -293,7 +293,6 @@ fn main() {
     // TODO: measure time since last ping sent, if above => send ping
     // TODO: measure time since last "ok ping", if above => reconnect
 
-
     loop {
         let evctx = e_rx.recv().expect("no error");
         let id = evctx.user_id;
