@@ -274,6 +274,47 @@ fn route() {
     }
 }
 
+/*
+
+WLambda API Experiments:
+
+
+dn:wsmp:listen "0.0.0.0:18444" {!(id, msg) = @;
+    # id is a pair for internal routing!
+    dn:wsmp:send id $["my:reply", 1, 2];
+};
+
+!cli_id     = dn:wsmp:connect "192.168.2.10:18444";
+
+!p_id       = dn:process:connect :line $["wlambda"];
+
+!t_id       = dn:timer:one_shot :ms => 1000 $[:timer1];
+!wkup_t_id  = dn:timer:interval :ms => 1000 $[:wakeup];
+
+!last_con_id = $n;
+!:global on_msg = {!(id, con_id, msg) = @;
+    ? id == srv_id {
+        match msg.0
+            "eval" => {
+                .last_con_id = con_id;
+                dn:send p_id "std:displayln 10 + 20";
+            };
+        break[];
+    };
+    ? id == cli_id {
+        break[];
+    };
+    ? id == p_id {
+        dn:send $p(srv_id, last_con_id) $["eval:result", msg];
+    };
+};
+
+
+
+
+
+*/
+
 fn main() {
     use tcp_csv_msg_connection::{Event, EventCtx, Msg};
 
@@ -305,8 +346,6 @@ fn main() {
         let id = evctx.user_id;
         let ev = evctx.event;
 
-
-//        assert_eq!(id, 12);
 
         println!("EVENT: {:?}", ev);
         match ev {

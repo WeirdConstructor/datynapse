@@ -463,13 +463,6 @@ impl TCPCSVServer {
             let mut connections = std::collections::HashMap::new();
             loop {
                 match writer_rx.recv() {
-                    // TODO: Make an internal event_tx, that intercepts
-                    //       all the TCPCSVConnection disconnect events
-                    //       and cleans up
-                    // XXX: OR! We just define a function that the user of
-                    //      TCPCSVServer can plug into his event_tx handler
-                    //      that intercepts the Connection-Errors and
-                    //      sends internal cleanup events to this thread.
                     Ok(ServerInternalEvent::NewConnection(stream)) => {
                         id_counter += 1;
                         let mut con =
@@ -485,7 +478,9 @@ impl TCPCSVServer {
                         }
                     },
                     Ok(ServerInternalEvent::SendMessage(id, msg)) => {
-                        println!("SEND MESSAGE");
+                        if let Some(con) = connections.get_mut(&id) {
+                            con.as_mut().unwrap().send(msg);
+                        }
                     },
                     Err(e) => {
                         send_event!("listener_mgmt", 0, event_tx,
