@@ -279,7 +279,7 @@ fn main() {
 
     let (e_tx, e_rx) = EventCtx::new_queue();
 
-    let mut con = tcp_csv_msg_connection::TCPCSVConnection::new(12, e_tx);
+    let mut con = tcp_csv_msg_connection::TCPCSVConnection::new(12, e_tx.clone());
     con.connect("127.0.0.1:18444");
 
     let my_name       = "test run";
@@ -290,17 +290,25 @@ fn main() {
     let mut hello_recv = false;
     let mut hello_sent = false;
 
+    let mut srv = tcp_csv_msg_connection::TCPCSVServer::new(100000, e_tx);
+    srv.start_listener("0.0.0.0:18431");
+
     // TODO: measure time since last ping sent, if above => send ping
     // TODO: measure time since last "ok ping", if above => reconnect
 
     loop {
         let evctx = e_rx.recv().expect("no error");
+        if evctx.user_id > 100000 {
+            srv.check_event_to_handle(&evctx);
+        }
+
         let id = evctx.user_id;
         let ev = evctx.event;
 
-        assert_eq!(id, 12);
 
-        //d// println!("EVENT: {:?}", ev);
+//        assert_eq!(id, 12);
+
+        println!("EVENT: {:?}", ev);
         match ev {
             Event::ConnectionAvailable => {
                 logged_in = false;
@@ -309,6 +317,8 @@ fn main() {
                     my_version.to_string(),
                     proto_version.to_string()
                 ]));
+            },
+            Event::ConnectionLost => {
             },
             Event::RecvMessage(msg) => {
                 match &msg {

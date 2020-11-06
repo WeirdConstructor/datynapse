@@ -7,6 +7,19 @@ use std::fmt::Write;
 
 use crate::sync_event::SyncEvent;
 
+macro_rules! send_event {
+    ($where: expr, $user_id: expr, $event_tx: expr, $event: expr) => {
+        if let Err(e) = $event_tx.send(EventCtx::new($user_id, $event)) {
+            let _ =
+                $event_tx.send(
+                    EventCtx::new($user_id,
+                        Event::LogErr(
+                            format!("error sending event from {}: {}", $where, e))));
+            break;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     Direct(Vec<String>),
@@ -343,6 +356,7 @@ pub enum Event {
     RecvMessage(Msg),
     SentMessage,
     ConnectionAvailable,
+    ConnectionLost,
     ReaderConnectionAvailable,
     ConnectError(String),
     LogErr(String),
@@ -365,73 +379,6 @@ impl EventCtx {
     }
 }
 
-type ClientID = usize;
-
-#[derive(Debug, Clone)]
-pub enum ServerEvent {
-    Client(ClientID, Event),
-    Server(Event),
-}
-
-pub struct TCPCSVServer {
-    op_timeout_ms:      u64,
-    connections:        Vec<Arc<TCPServerConnection>>,
-    free_ids:           Vec<ClientID>,
-}
-
-pub struct TCPServerConInfo {
-    last_activity_time: std::time::SystemTime,
-}
-
-pub struct TCPServerConnection {
-    stream: TcpStream,
-    info:   Mutex<TCPServerConInfo>,
-}
-
-impl TCPCSVServer {
-    fn server_event(&self, e: Event) {
-    }
-
-    fn spawn_server_thread(&mut self) -> Result<(), std::io::Error> {
-        let (stream_tx, stream_rx) = std::sync::mpsc::channel();
-        let l = TcpListener::bind("0.0.0.0:57322")?;
-
-        let op_timeout_ms = self.op_timeout_ms;
-        std::thread::spawn(move || {
-            for stream in l.incoming() {
-                let stream =
-                    match stream {
-                        Ok(s) => s,
-                        Err(e) => {
-                            if let Err(e) =
-                                stream_tx.send(
-                                    Event::ConnectError(
-                                        format!("Client listener error: {}", e)))
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-
-                stream.set_nodelay(true)
-                    .expect("Setting TCP no delay");
-                stream.set_read_timeout(
-                    Some(std::time::Duration::from_millis(op_timeout_ms)))
-                    .expect("Setting read timeout");
-                stream.set_write_timeout(
-                    Some(std::time::Duration::from_millis(op_timeout_ms)))
-                    .expect("Setting write timeout");
-                stream.set_nonblocking(true)
-                    .expect("Setting non-blocking");
-
-            }
-        });
-
-        Ok(())
-    }
-}
-
 fn set_stream_settings(stream: &mut TcpStream, op_timeout_ms: u64) {
     stream.set_nodelay(true)
         .expect("Setting TCP no delay");
@@ -441,6 +388,117 @@ fn set_stream_settings(stream: &mut TcpStream, op_timeout_ms: u64) {
     stream.set_write_timeout(
         Some(std::time::Duration::from_millis(op_timeout_ms)))
         .expect("Setting write timeout");
+}
+
+enum ServerInternalEvent {
+    NewConnection(TcpStream),
+    RemoveConnection(u64),
+    SendMessage(u64, Msg),
+}
+
+pub struct TCPCSVServer {
+    event_tx:       mpsc::Sender<EventCtx>,
+    writer_tx:      mpsc::Sender<ServerInternalEvent>,
+    writer_rx:      Option<mpsc::Receiver<ServerInternalEvent>>,
+    init_id:        u64,
+    op_timeout_ms:  u64,
+}
+
+impl TCPCSVServer {
+    pub fn new(init_id: u64, event_tx: mpsc::Sender<EventCtx>) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel();
+        Self {
+            writer_rx:      Some(writer_rx),
+            op_timeout_ms:  1000,
+            init_id,
+            writer_tx,
+            event_tx,
+        }
+    }
+
+    pub fn send(&mut self, id: u64, msg: Msg) {
+        self.writer_tx.send(ServerInternalEvent::SendMessage(id, msg)).is_ok();
+    }
+
+    pub fn check_event_to_handle(&mut self, ev: &EventCtx) {
+        match ev.event {
+            Event::ConnectionLost => {
+                self.writer_tx.send(
+                    ServerInternalEvent::RemoveConnection(ev.user_id)).is_ok();
+            },
+            _ => (),
+        }
+    }
+
+    pub fn start_listener(&mut self, ep: &str) -> Result<(), std::io::Error> {
+        let l = TcpListener::bind(ep)?;
+
+        let op_timeout_ms = self.op_timeout_ms;
+        let event_tx      = self.event_tx.clone();
+        let writer_tx     = self.writer_tx.clone();
+
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let mut stream =
+                    match stream {
+                        Ok(s) => s,
+                        Err(e) => {
+                            send_event!("listener", 0, event_tx,
+                                Event::ConnectError(format!("{}", e)));
+                            break;
+                        }
+                    };
+
+                set_stream_settings(&mut stream, op_timeout_ms);
+
+                writer_tx.send(ServerInternalEvent::NewConnection(stream)).is_ok();
+            }
+        });
+
+        let writer_rx = self.writer_rx.take().unwrap();
+        let event_tx = self.event_tx.clone();
+        let mut id_counter = self.init_id;
+
+        std::thread::spawn(move || {
+            let mut connections = std::collections::HashMap::new();
+            loop {
+                match writer_rx.recv() {
+                    // TODO: Make an internal event_tx, that intercepts
+                    //       all the TCPCSVConnection disconnect events
+                    //       and cleans up
+                    // XXX: OR! We just define a function that the user of
+                    //      TCPCSVServer can plug into his event_tx handler
+                    //      that intercepts the Connection-Errors and
+                    //      sends internal cleanup events to this thread.
+                    Ok(ServerInternalEvent::NewConnection(stream)) => {
+                        id_counter += 1;
+                        let mut con =
+                            TCPCSVConnection::new(id_counter, event_tx.clone());
+                        con.set_stream(stream);
+                        connections.insert(id_counter, Some(con));
+
+                        println!("NEW CON");
+                    },
+                    Ok(ServerInternalEvent::RemoveConnection(id)) => {
+                        if let Some(con) = connections.remove(&id) {
+                            con.unwrap().shutdown();
+                        }
+                    },
+                    Ok(ServerInternalEvent::SendMessage(id, msg)) => {
+                        println!("SEND MESSAGE");
+                    },
+                    Err(e) => {
+                        send_event!("listener_mgmt", 0, event_tx,
+                            Event::LogErr(
+                                format!("Error reading event: {}", e)));
+                        break;
+                    },
+                }
+            }
+        });
+
+        Ok(())
+    }
 }
 
 /// A persistent TCP connection
@@ -468,19 +526,6 @@ pub struct TCPCSVConnection {
     stop:               std::sync::Arc<AtomicBool>,
     need_reconnect:     std::sync::Arc<AtomicBool>,
     user_id:            u64,
-}
-
-macro_rules! send_event {
-    ($where: expr, $user_id: expr, $event_tx: expr, $event: expr) => {
-        if let Err(e) = $event_tx.send(EventCtx::new($user_id, $event)) {
-            let _ =
-                $event_tx.send(
-                    EventCtx::new($user_id,
-                        Event::LogErr(
-                            format!("error sending event from {}: {}", $where, e))));
-            break;
-        }
-    }
 }
 
 impl TCPCSVConnection {
@@ -586,6 +631,9 @@ impl TCPCSVConnection {
                                 stream = None;
                                 need_reconnect.store(
                                     true, std::sync::atomic::Ordering::Relaxed);
+
+                                send_event!("reader", user_id, event_tx,
+                                    Event::ConnectionLost);
                             },
                         }
                     }
@@ -690,6 +738,9 @@ impl TCPCSVConnection {
                                             format!("write error: {}", e)));
                                     need_reconnect.store(
                                         true, std::sync::atomic::Ordering::Relaxed);
+
+                                    send_event!("reader", user_id, event_tx,
+                                        Event::ConnectionLost);
                                     continue;
                                 }
                             }
@@ -704,32 +755,6 @@ impl TCPCSVConnection {
         })
     }
 
-    fn start_server(&mut self, ep: &str) -> Result<(), std::io::Error> {
-        let l = TcpListener::bind(ep)?;
-
-        let stop          = self.stop.clone();
-        let op_timeout_ms = self.op_timeout_ms;
-        let event_tx      = self.event_tx.clone();
-
-        std::thread::spawn(move || {
-            for stream in l.incoming() {
-                let mut stream =
-                    match stream {
-                        Ok(s) => s,
-                        Err(e) => {
-                            send_event!("listener", 0, event_tx,
-                                Event::ConnectError(format!("{}", e)));
-                            break;
-                        }
-                    };
-
-                set_stream_settings(&mut stream, op_timeout_ms);
-            }
-        });
-
-        Ok(())
-    }
-
     pub fn connect(&mut self, ep: &str) {
         if self.connector.is_some() {
             return;
@@ -738,6 +763,15 @@ impl TCPCSVConnection {
         self.connector = Some(self.start_connect(ep.to_string()));
 
         self.need_reconnect.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+
+    pub fn set_stream(&mut self, stream: TcpStream) {
+        self.need_reconnect.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.new_writer_stream.send(
+            stream.try_clone()
+                  .expect("cloing a TcpStream to work"));
+        self.new_reader_stream.send(stream);
     }
 
     fn start_connect(&mut self, ep: String) -> std::thread::JoinHandle<()> {
@@ -795,7 +829,18 @@ impl TCPCSVConnection {
     }
 
     pub fn shutdown(&mut self) {
-//        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(con) = self.connector.take() {
+            con.join();
+        }
+        if let Some(wr) = self.writer.take() {
+            wr.join();
+        }
+        if let Some(rd) = self.reader.take() {
+            rd.join();
+        }
+        println!("*****=========> SHUTDOWN!");
+
 //        if let Some(wtx) = &self.writer_tx {
 //            if let Err(_) = wtx.send(None) {
 //            }
