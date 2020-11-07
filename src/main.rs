@@ -4,8 +4,11 @@ mod tcp_csv_msg_connection;
 mod sync_event;
 
 use std::thread::{JoinHandle, spawn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::mpsc::*;
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use wlambda::*;
 
@@ -30,6 +33,7 @@ fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandl
         let mut min_timeout = 100000000;
 
         loop {
+            let before_recv = Instant::now();
             match rx.recv_timeout(Duration::from_millis(min_timeout)) {
                 Ok(timer) => {
                     if free_list.is_empty() {
@@ -47,35 +51,38 @@ fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandl
                 },
             }
 
+            let passed_time = before_recv.elapsed().as_millis() as u64;
+
             min_timeout = max_timeout;
 
-            for (idx, timer) in list.iter().enumerate() {
+            for (idx, timer) in list.iter_mut().enumerate() {
                 match timer {
+                    Timer::Timeouted => (),
                     Timer::Oneshot(id, tout) => {
-                        if tout > passed_time {
-                            let new_tout = tout - passed_time;
+                        if *tout > passed_time {
+                            let new_tout = *tout - passed_time;
                             if new_tout < min_timeout {
                                 min_timeout = new_tout;
                             }
 
-                            *timer = Timer::Oneshot(id, new_tout);
+                            *timer = Timer::Oneshot(*id, new_tout);
                         } else {
-                            event_tx.send(Event::Timeout(id));
+                            event_tx.send(Event::Timeout(*id));
                             *timer = Timer::Timeouted;
                             free_list.push(idx);
                         }
                     },
                     Timer::Interval(id, tout, orig_tout) => {
-                        if tout > passed_time {
-                            let new_tout = tout - passed_time;
+                        if *tout > passed_time {
+                            let new_tout = *tout - passed_time;
                             if new_tout < min_timeout {
                                 min_timeout = new_tout;
                             }
 
-                            *timer = Timer::Interval(id, new_tout, orig_tout);
+                            *timer = Timer::Interval(*id, new_tout, *orig_tout);
                         } else {
-                            event_tx.send(Event::Timeout(id));
-                            *timer = Timer::Interval(id, orig_tout, orig_tout);
+                            event_tx.send(Event::Timeout(*id));
+                            *timer = Timer::Interval(*id, *orig_tout, *orig_tout);
                         }
                     },
                 }
@@ -85,6 +92,14 @@ fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandl
 }
 
 fn main() {
+    let (event_tx, event_rx) = channel();
+    let (timer_tx, timer_rx) = channel();
+
+    let timer_thread = start_timer_thread(event_tx.clone(), timer_rx);
+    let mut cur_id = Rc::new(RefCell::new(0_u64));
+
+    let mut callbacks = Rc::new(RefCell::new(HashMap::new()));
+
     let global = GlobalEnv::new_default();
     global.borrow_mut().add_func(
         "dn:wsmp:listen",
@@ -98,21 +113,34 @@ fn main() {
             Ok(VVal::None)
         }, Some(0), Some(0));
 
+    let cb_callbacks = callbacks.clone();
     global.borrow_mut().add_func(
         "dn:on",
         move |env: &mut Env, _argc: usize| {
             // store callback for given id in global register
+            let id = env.arg(0).i() as u64;
+            cb_callbacks.borrow_mut().insert(id, env.arg(1));
             Ok(VVal::None)
-        }, Some(0), Some(0));
+        }, Some(2), Some(2));
 
+    let t1_tx = timer_tx.clone();
     global.borrow_mut().add_func(
         "dn:timer:oneshot",
         move |env: &mut Env, _argc: usize| {
-            // draw id
-            // send timer setup to global timer thread
-            // store id in global register
-            Ok(VVal::None)
-        }, Some(0), Some(0));
+            let dur =
+                match env.arg(0).to_duration() {
+                    Ok(dur) => dur,
+                    Err(v)  => { return Ok(v); },
+                };
+
+            *cur_id.borrow_mut() += 1;
+            let cur_id = *cur_id.borrow();
+
+            t1_tx.send(Timer::Oneshot(cur_id, dur.as_millis() as u64))
+                 .is_ok(); // TODO: Handle error and log it!
+
+            Ok(VVal::Int(cur_id as i64))
+        }, Some(1), Some(1));
 
     global.borrow_mut().add_func(
         "dn:send",
@@ -123,6 +151,45 @@ fn main() {
 
 
     let mut ctx = EvalContext::new(global);
+
+    let argv : Vec<String> = std::env::args().collect();
+
+    let filepath =
+        if argv.len() > 1 {
+            argv[1].to_string()
+        } else {
+            "init.wl".to_string()
+        };
+
+    ctx.eval_file(&filepath)
+       .expect("correct evaluation of initialization file");
+
+    loop {
+        if let Ok(ev) = event_rx.recv() {
+            let mut remove = None;
+            match ev {
+                Event::Timeout(id) => {
+                    if let Some(cb) = callbacks.borrow().get(&id) {
+                        let ret =
+                            ctx.call(cb, &[]).expect("no error in cb");
+
+                        if ret.with_s_ref(|s| s == "delete") {
+                            remove = Some(id);
+                        }
+                    }
+                },
+                Event::LogErr(err) => {
+                    eprintln!("Error: {}", err);
+                },
+            }
+
+            if let Some(remove_id) = remove {
+                callbacks.borrow_mut().remove(&remove_id);
+            }
+        } else {
+            break;
+        }
+    }
 }
 
 /*
