@@ -3,7 +3,86 @@
 mod tcp_csv_msg_connection;
 mod sync_event;
 
+use std::thread::{JoinHandle, spawn};
+use std::time::Duration;
+use std::sync::mpsc::*;
+
 use wlambda::*;
+
+
+enum Event {
+    Timeout(u64),
+    LogErr(String),
+}
+
+enum Timer {
+    Timeouted,
+    Oneshot(u64, u64),
+    Interval(u64, u64, u64),
+}
+
+fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandle<()> {
+    spawn(move || {
+        let mut list = vec![];
+        let mut free_list = vec![];
+
+        let mut max_timeout = 100000000;
+        let mut min_timeout = 100000000;
+
+        loop {
+            match rx.recv_timeout(Duration::from_millis(min_timeout)) {
+                Ok(timer) => {
+                    if free_list.is_empty() {
+                        list.push(timer);
+                    } else {
+                        let idx = free_list.pop().unwrap();
+                        list[idx] = timer;
+                    }
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    ()
+                },
+                Err(RecvTimeoutError::Disconnected) => {
+                    break;
+                },
+            }
+
+            min_timeout = max_timeout;
+
+            for (idx, timer) in list.iter().enumerate() {
+                match timer {
+                    Timer::Oneshot(id, tout) => {
+                        if tout > passed_time {
+                            let new_tout = tout - passed_time;
+                            if new_tout < min_timeout {
+                                min_timeout = new_tout;
+                            }
+
+                            *timer = Timer::Oneshot(id, new_tout);
+                        } else {
+                            event_tx.send(Event::Timeout(id));
+                            *timer = Timer::Timeouted;
+                            free_list.push(idx);
+                        }
+                    },
+                    Timer::Interval(id, tout, orig_tout) => {
+                        if tout > passed_time {
+                            let new_tout = tout - passed_time;
+                            if new_tout < min_timeout {
+                                min_timeout = new_tout;
+                            }
+
+                            *timer = Timer::Interval(id, new_tout, orig_tout);
+                        } else {
+                            event_tx.send(Event::Timeout(id));
+                            *timer = Timer::Interval(id, orig_tout, orig_tout);
+                        }
+                    },
+                }
+            }
+        }
+    })
+}
 
 fn main() {
     let global = GlobalEnv::new_default();
