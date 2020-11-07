@@ -1,5 +1,5 @@
 !id = dn:timer:oneshot :ms => 1000;
-!id2 = dn:timer:oneshot :ms => 2000;
+!id2 = dn:timer:interval :ms => 2000;
 
 dn:on id {
     std:displayln "timeout";

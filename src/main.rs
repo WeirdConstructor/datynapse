@@ -13,11 +13,13 @@ use std::collections::HashMap;
 use wlambda::*;
 
 
+#[derive(Debug, Clone)]
 enum Event {
     Timeout(u64),
     LogErr(String),
 }
 
+#[derive(Debug, Clone, Copy)]
 enum Timer {
     Timeouted,
     Oneshot(u64, u64),
@@ -82,11 +84,18 @@ fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandl
                             *timer = Timer::Interval(*id, new_tout, *orig_tout);
                         } else {
                             event_tx.send(Event::Timeout(*id));
+                            let new_tout = *orig_tout;
+                            if new_tout < min_timeout {
+                                min_timeout = new_tout;
+                            }
+
                             *timer = Timer::Interval(*id, *orig_tout, *orig_tout);
                         }
                     },
                 }
             }
+
+            println!("RR: {:?}", list);
         }
     })
 }
@@ -123,7 +132,8 @@ fn main() {
             Ok(VVal::None)
         }, Some(2), Some(2));
 
-    let t1_tx = timer_tx.clone();
+    let t_tx = timer_tx.clone();
+    let c_id = cur_id.clone();
     global.borrow_mut().add_func(
         "dn:timer:oneshot",
         move |env: &mut Env, _argc: usize| {
@@ -133,10 +143,31 @@ fn main() {
                     Err(v)  => { return Ok(v); },
                 };
 
-            *cur_id.borrow_mut() += 1;
-            let cur_id = *cur_id.borrow();
+            *c_id.borrow_mut() += 1;
+            let cur_id = *c_id.borrow();
 
-            t1_tx.send(Timer::Oneshot(cur_id, dur.as_millis() as u64))
+            t_tx.send(Timer::Oneshot(cur_id, dur.as_millis() as u64))
+                 .is_ok(); // TODO: Handle error and log it!
+
+            Ok(VVal::Int(cur_id as i64))
+        }, Some(1), Some(1));
+
+    let t_tx = timer_tx.clone();
+    let c_id = cur_id.clone();
+    global.borrow_mut().add_func(
+        "dn:timer:interval",
+        move |env: &mut Env, _argc: usize| {
+            let dur =
+                match env.arg(0).to_duration() {
+                    Ok(dur) => dur,
+                    Err(v)  => { return Ok(v); },
+                };
+
+            *c_id.borrow_mut() += 1;
+            let cur_id = *c_id.borrow();
+
+            let dur = dur.as_millis() as u64;
+            t_tx.send(Timer::Interval(cur_id, dur, dur))
                  .is_ok(); // TODO: Handle error and log it!
 
             Ok(VVal::Int(cur_id as i64))
