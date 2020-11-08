@@ -1,118 +1,38 @@
 //mod detached_command;
 //use detached_command::*;
-mod tcp_csv_msg_connection;
-mod sync_event;
 
-use std::thread::{JoinHandle, spawn};
-use std::time::{Duration, Instant};
-use std::sync::mpsc::*;
+//mod tcp_csv_msg_connection;
+
+//mod sync_event;
+
+mod event;
+mod timer;
+mod msg;
+mod process;
+
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::mpsc::*;
 
 use wlambda::*;
 
-
-#[derive(Debug, Clone)]
-enum Event {
-    Timeout(u64),
-    LogErr(String),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Timer {
-    Timeouted,
-    Oneshot(u64, u64),
-    Interval(u64, u64, u64),
-}
-
-fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinHandle<()> {
-    spawn(move || {
-        let mut list = vec![];
-        let mut free_list = vec![];
-
-        let mut max_timeout = 100000000;
-        let mut min_timeout = 100000000;
-
-        loop {
-            let before_recv = Instant::now();
-            match rx.recv_timeout(Duration::from_millis(min_timeout)) {
-                Ok(timer) => {
-                    if free_list.is_empty() {
-                        list.push(timer);
-                    } else {
-                        let idx = free_list.pop().unwrap();
-                        list[idx] = timer;
-                    }
-                },
-                Err(RecvTimeoutError::Timeout) => {
-                    ()
-                },
-                Err(RecvTimeoutError::Disconnected) => {
-                    break;
-                },
-            }
-
-            let passed_time = before_recv.elapsed().as_millis() as u64;
-
-            min_timeout = max_timeout;
-
-            for (idx, timer) in list.iter_mut().enumerate() {
-                match timer {
-                    Timer::Timeouted => (),
-                    Timer::Oneshot(id, tout) => {
-                        if *tout > passed_time {
-                            let new_tout = *tout - passed_time;
-                            if new_tout < min_timeout {
-                                min_timeout = new_tout;
-                            }
-
-                            *timer = Timer::Oneshot(*id, new_tout);
-                        } else {
-                            event_tx.send(Event::Timeout(*id));
-                            *timer = Timer::Timeouted;
-                            free_list.push(idx);
-                        }
-                    },
-                    Timer::Interval(id, tout, orig_tout) => {
-                        if *tout > passed_time {
-                            let new_tout = *tout - passed_time;
-                            if new_tout < min_timeout {
-                                min_timeout = new_tout;
-                            }
-
-                            *timer = Timer::Interval(*id, new_tout, *orig_tout);
-                        } else {
-                            event_tx.send(Event::Timeout(*id));
-                            let new_tout = *orig_tout;
-                            if new_tout < min_timeout {
-                                min_timeout = new_tout;
-                            }
-
-                            *timer = Timer::Interval(*id, *orig_tout, *orig_tout);
-                        }
-                    },
-                }
-            }
-
-            println!("RR: {:?}", list);
-        }
-    })
-}
+use crate::timer::*;
+use crate::event::*;
 
 fn main() {
     let (event_tx, event_rx) = channel();
     let (timer_tx, timer_rx) = channel();
 
-    let timer_thread = start_timer_thread(event_tx.clone(), timer_rx);
-    let mut cur_id = Rc::new(RefCell::new(0_u64));
+    let _timer_thread = start_timer_thread(event_tx.clone(), timer_rx);
+    let cur_id = Rc::new(RefCell::new(0_u64));
 
-    let mut callbacks = Rc::new(RefCell::new(HashMap::new()));
+    let callbacks = Rc::new(RefCell::new(HashMap::new()));
 
     let global = GlobalEnv::new_default();
     global.borrow_mut().add_func(
         "dn:wsmp:listen",
-        move |env: &mut Env, _argc: usize| {
+        move |_env: &mut Env, _argc: usize| {
             // create mpsc
             // draw new id
             // store mpsc sender in global register
@@ -175,7 +95,7 @@ fn main() {
 
     global.borrow_mut().add_func(
         "dn:send",
-        move |env: &mut Env, _argc: usize| {
+        move |_env: &mut Env, _argc: usize| {
             // store callback for given id in global register
             Ok(VVal::None)
         }, Some(0), Some(0));
@@ -202,12 +122,30 @@ fn main() {
                 Event::Timeout(id) => {
                     if let Some(cb) = callbacks.borrow().get(&id) {
                         let ret =
-                            ctx.call(cb, &[]).expect("no error in cb");
+                            ctx.call(cb, &[VVal::Int(id as i64)]).expect("no error in cb");
 
                         if ret.with_s_ref(|s| s == "delete") {
                             remove = Some(id);
                         }
                     }
+                },
+                Event::Message(id, msg) => {
+                    if let Some(cb) = callbacks.borrow().get(&id) {
+                        let ret =
+                            ctx.call(cb, &[VVal::Int(id as i64), msg.into_vval()])
+                               .expect("no error in cb");
+
+                        if ret.with_s_ref(|s| s == "delete") {
+                            // FIXME: We need to kill the send
+                            //        channel of the process! Which should
+                            //        also kill the process itself.
+                            remove = Some(id);
+                        }
+                    }
+                },
+                Event::DeleteCallback(id) => {
+                    println!("DEBUG: Removed cb {}", id);
+                    remove = Some(id);
                 },
                 Event::LogErr(err) => {
                     eprintln!("Error: {}", err);
@@ -216,6 +154,9 @@ fn main() {
 
             if let Some(remove_id) = remove {
                 callbacks.borrow_mut().remove(&remove_id);
+                // FIXME: We need to kill the send
+                //        channel of the process! Which should
+                //        also kill the process itself.
             }
         } else {
             break;

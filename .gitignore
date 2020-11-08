@@ -1,2 +1,4 @@
 /target
+src/stuff.rs
+*.history
 **/*.rs.bk
