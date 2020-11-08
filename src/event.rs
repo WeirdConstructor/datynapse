@@ -70,28 +70,28 @@ impl Msg {
                 }
             },
             Msg::Bytes(args, b) => {
-                let v =
-                    if let Some(args) = args {
+                if let Some(args) = args {
+                    let v =
                         VVal::vec_mv(
                             args.into_iter().map(
-                                |a| VVal::new_str_mv(a)).collect())
-                    } else {
-                        VVal::vec()
-                    };
-                v.push(VVal::new_byt(b));
-                v
+                                |a| VVal::new_str_mv(a)).collect());
+                    v.push(VVal::new_byt(b));
+                    v
+                } else {
+                    VVal::new_byt(b)
+                }
             },
             Msg::Str(args, s) => {
-                let v =
-                    if let Some(args) = args {
+                if let Some(args) = args {
+                    let v =
                         VVal::vec_mv(
                             args.into_iter().map(
-                                |a| VVal::new_str_mv(a)).collect())
-                    } else {
-                        VVal::vec()
-                    };
-                v.push(VVal::new_str_mv(s));
-                v
+                                |a| VVal::new_str_mv(a)).collect());
+                    v.push(VVal::new_str_mv(s));
+                    v
+                } else {
+                    VVal::new_str_mv(s)
+                }
             },
             Msg::Direct(args) => {
                 VVal::vec_mv(
@@ -105,7 +105,7 @@ impl Msg {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum Event {
-    DeleteCallback(u64),
+    PortEnd(u64),
     Timeout(u64),
     Message(u64, Msg),
     LogErr(String),

@@ -26,12 +26,12 @@ pub fn kill_child(child: &Arc<Mutex<std::process::Child>>) {
     }
 }
 
-pub fn start_process(event_tx: Sender<Event>,
-                     rx: Receiver<Cmd>,
-                     id: u64,
-                     cmd_exe: &str,
-                     args: &[&str],
-                     protocol: CmdProtocol) -> JoinHandle<()>
+pub fn start(event_tx: Sender<Event>,
+             rx: Receiver<Cmd>,
+             id: u64,
+             cmd_exe: &str,
+             args: &[String],
+             protocol: CmdProtocol) -> JoinHandle<()>
 {
     let mut cmd = Command::new(cmd_exe);
     let cmd_exe = cmd_exe.to_string();
@@ -116,9 +116,9 @@ pub fn start_process(event_tx: Sender<Event>,
                     let mut line = String::new();
                     match br.read_line(&mut line) {
                         Ok(s) => {
+                            if s == 0 { break; }
                             event_tx.send(
                                 Event::Message(id, Msg::Str(None, line))).is_ok();
-                            if s == 0 { break; }
                         },
                         Err(e) => {
                             event_tx.send(
@@ -134,7 +134,8 @@ pub fn start_process(event_tx: Sender<Event>,
             CmdProtocol::WSMP => {
                 let mut stdout = std::io::BufReader::new(stdout);
 
-                loop {
+                let mut end = false;
+                while !end {
                     let mut rd = msg::MessageReader::new();
                     let mut try_again = true;
 
@@ -168,12 +169,17 @@ pub fn start_process(event_tx: Sender<Event>,
                             Err(msg::ReadMsgError::TryAgain) => {
                                 try_again = true;
                             },
+                            Err(msg::ReadMsgError::EOF) => {
+                                kill_child(&child);
+                                end = true;
+                            },
                             Err(e) => {
                                 event_tx.send(
                                     Event::LogErr(
                                         format!("Error executing '{}': {:?}",
                                             cmd_exe, e))).is_ok();
                                 kill_child(&child);
+                                end = true;
                             },
                         }
                     }
@@ -184,6 +190,8 @@ pub fn start_process(event_tx: Sender<Event>,
         if let Ok(mut stop) = stop.lock() {
             *stop = true;
         }
+
+        writer_thread.join();
 
         match child.lock() {
             Ok(mut child) =>
@@ -196,7 +204,7 @@ pub fn start_process(event_tx: Sender<Event>,
                                         "end".to_string(),
                                         status.code().unwrap_or(-1).to_string()])))
                                 .is_ok();
-                        event_tx.send(Event::DeleteCallback(id)).is_ok();
+                        event_tx.send(Event::PortEnd(id)).is_ok();
                     },
                     Err(e) => {
                         event_tx.send(
@@ -211,8 +219,6 @@ pub fn start_process(event_tx: Sender<Event>,
                         format!("Error lock child waiting for end of '{}': {}",
                                 cmd_exe, e))).is_ok();
             },
-        }
-
-        writer_thread.join();
+        };
     })
 }

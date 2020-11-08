@@ -20,6 +20,29 @@ use wlambda::*;
 use crate::timer::*;
 use crate::event::*;
 
+enum Port {
+    Process(Sender<process::Cmd>, std::thread::JoinHandle<()>),
+}
+
+impl Port {
+    pub fn send_kill(self) {
+        match self {
+            Port::Process(sender, thread) => {
+                sender.send(process::Cmd::Kill).is_ok();
+            },
+        }
+    }
+
+    pub fn join(self) {
+        match self {
+            Port::Process(sender, thread) => {
+                drop(sender);
+                thread.join();
+            },
+        }
+    }
+}
+
 fn main() {
     let (event_tx, event_rx) = channel();
     let (timer_tx, timer_rx) = channel();
@@ -28,6 +51,7 @@ fn main() {
     let cur_id = Rc::new(RefCell::new(0_u64));
 
     let callbacks = Rc::new(RefCell::new(HashMap::new()));
+    let ports : Rc<RefCell<HashMap<u64, Port>>> = Rc::new(RefCell::new(HashMap::new()));
 
     let global = GlobalEnv::new_default();
     global.borrow_mut().add_func(
@@ -93,6 +117,69 @@ fn main() {
             Ok(VVal::Int(cur_id as i64))
         }, Some(1), Some(1));
 
+    {
+        let ports = ports.clone();
+        global.borrow_mut().add_func(
+            "dn:kill",
+            move |env: &mut Env, _argc: usize| {
+                let id = env.arg(0).i() as u64;
+                if let Some(port) = ports.borrow_mut().remove(&id) {
+                    port.send_kill();
+                }
+                Ok(VVal::None)
+            }, Some(1), Some(1));
+    }
+
+    global.borrow_mut().add_func(
+        "dn:send",
+        move |_env: &mut Env, _argc: usize| {
+            // store callback for given id in global register
+            Ok(VVal::None)
+        }, Some(0), Some(0));
+
+    {
+        let ports    = ports.clone();
+        let cur_id   = cur_id.clone();
+        let event_tx = event_tx.clone();
+
+        global.borrow_mut().add_func(
+            "dn:process:start",
+            move |env: &mut Env, argc: usize| {
+                let (idx_offs, proto) =
+                    if argc == 3 {
+                        (1,
+                            env.arg(0).with_s_ref(|s|
+                                match s {
+                                    "wsmp" => process::CmdProtocol::WSMP,
+                                    _      => process::CmdProtocol::LineBased,
+                                }))
+                    } else {
+                        (0, process::CmdProtocol::LineBased)
+                    };
+
+                *cur_id.borrow_mut() += 1;
+                let cur_id = *cur_id.borrow();
+
+                let event_tx = event_tx.clone();
+                env.arg(idx_offs).with_s_ref(|cmd| {
+                    let args : Vec<String> =
+                        env.arg(idx_offs + 1)
+                           .iter()
+                           .map(|v| v.0.s_raw()).collect();
+
+                    let (tx, rx) = channel();
+
+                    let thread =
+                        process::start(event_tx, rx, cur_id, cmd, &args, proto);
+
+                    ports.borrow_mut()
+                         .insert(cur_id, Port::Process(tx, thread));
+                });
+
+                Ok(VVal::Int(cur_id as i64))
+            }, Some(2), Some(3));
+    }
+
     global.borrow_mut().add_func(
         "dn:send",
         move |_env: &mut Env, _argc: usize| {
@@ -118,6 +205,7 @@ fn main() {
     loop {
         if let Ok(ev) = event_rx.recv() {
             let mut remove = None;
+
             match ev {
                 Event::Timeout(id) => {
                     if let Some(cb) = callbacks.borrow().get(&id) {
@@ -136,15 +224,17 @@ fn main() {
                                .expect("no error in cb");
 
                         if ret.with_s_ref(|s| s == "delete") {
-                            // FIXME: We need to kill the send
-                            //        channel of the process! Which should
-                            //        also kill the process itself.
                             remove = Some(id);
                         }
                     }
                 },
-                Event::DeleteCallback(id) => {
+                Event::PortEnd(id) => {
                     println!("DEBUG: Removed cb {}", id);
+
+                    if let Some(port) = ports.borrow_mut().remove(&id) {
+                        port.join();
+                    }
+
                     remove = Some(id);
                 },
                 Event::LogErr(err) => {
@@ -154,9 +244,6 @@ fn main() {
 
             if let Some(remove_id) = remove {
                 callbacks.borrow_mut().remove(&remove_id);
-                // FIXME: We need to kill the send
-                //        channel of the process! Which should
-                //        also kill the process itself.
             }
         } else {
             break;

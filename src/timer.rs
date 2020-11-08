@@ -55,7 +55,7 @@ pub fn start_timer_thread(event_tx: Sender<Event>, rx: Receiver<Timer>) -> JoinH
                         } else {
                             // TODO: Handle send error!
                             event_tx.send(Event::Timeout(*id)).is_ok();
-                            event_tx.send(Event::DeleteCallback(*id)).is_ok();
+                            event_tx.send(Event::PortEnd(*id)).is_ok();
 
                             *timer = Timer::Timeouted;
                             free_list.push(idx);
