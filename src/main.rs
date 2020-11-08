@@ -1,7 +1,7 @@
 //mod detached_command;
 //use detached_command::*;
 
-//mod tcp_csv_msg_connection;
+//mod tcp;
 
 //mod sync_event;
 
@@ -25,10 +25,18 @@ enum Port {
 }
 
 impl Port {
-    pub fn send_kill(self) {
+    pub fn send_kill(&self) {
         match self {
             Port::Process(sender, thread) => {
                 sender.send(process::Cmd::Kill).is_ok();
+            },
+        }
+    }
+
+    pub fn send_input(&self, input: Vec<u8>) {
+        match self {
+            Port::Process(sender, _thread) => {
+                sender.send(process::Cmd::Input(input)).is_ok();
             },
         }
     }
@@ -130,12 +138,24 @@ fn main() {
             }, Some(1), Some(1));
     }
 
-    global.borrow_mut().add_func(
-        "dn:send",
-        move |_env: &mut Env, _argc: usize| {
-            // store callback for given id in global register
-            Ok(VVal::None)
-        }, Some(0), Some(0));
+    {
+        let ports = ports.clone();
+        global.borrow_mut().add_func(
+            "dn:send",
+            move |env: &mut Env, _argc: usize| {
+                let id = env.arg(0).i() as u64;
+                if let Some(port) = ports.borrow_mut().get(&id) {
+                    if env.arg(1).is_bytes() {
+                        env.arg(1).with_bv_ref(|b| {
+                            port.send_input(b.to_vec());
+                        });
+                    } else {
+                        port.send_input(env.arg(1).s_raw().into_bytes());
+                    }
+                }
+                Ok(VVal::None)
+            }, Some(2), Some(2));
+    }
 
     {
         let ports    = ports.clone();
@@ -179,14 +199,6 @@ fn main() {
                 Ok(VVal::Int(cur_id as i64))
             }, Some(2), Some(3));
     }
-
-    global.borrow_mut().add_func(
-        "dn:send",
-        move |_env: &mut Env, _argc: usize| {
-            // store callback for given id in global register
-            Ok(VVal::None)
-        }, Some(0), Some(0));
-
 
     let mut ctx = EvalContext::new(global);
 

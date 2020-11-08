@@ -4,6 +4,18 @@ dn:on (dn:timer:oneshot :ms => 1000) {
     std:displayln "timeout" _;
 };
 
+!cat = dn:process:start :line "cat" $[];
+dn:on cat {
+    std:displayln "cat:" @;
+    ? std:str:trim[_1] == "QUIT" {
+        dn:kill cat;
+    };
+};
+
+dn:send cat "FOOBAR\n";
+dn:send cat "FOOBAR\n";
+dn:send cat "QUIT\n";
+
 dn:on (dn:process:start
     :wsmp "sh" $["-c", "echo \"direct foo ba \\\"foo babab\\\"\""]) {
 
